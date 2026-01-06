@@ -2,7 +2,7 @@
 
 ---
 
-## Overview and rationale
+## Overview
 
 To characterise gene content diversity, structural variation, and host-associated genomic features across the *Zang et al.* genome collection, we performed a comprehensive pangenome analysis using **PIRATE** (Pangenome Iterative Refinement and Threshold Evaluation). PIRATE is designed for large bacterial genome collections and explicitly models allelic diversity, gene fragmentation, fission/fusion events, and gene duplication by clustering genes across multiple amino-acid identity thresholds.
 
@@ -110,11 +110,30 @@ Identity thresholds spanning 80–98% are appropriate for *Campylobacter*, captu
 
 ---
 
-## Global pangenome structure (results)
+## Visualisation
+
+Additional plots were made to summarise core/accessory structure, allelic diversity, and structural variation across the pangenome.
+
+```bash
+python3 pirate_plotting.py --pirate-out PIRATE_out --outdir pirate_plots --all --palette life_aquatic_blues
+```
+---
+
+## Global pangenome structure
+
+The overall pangenome structure was summarised using rarefaction and gene-frequency analyses derived from PIRATE outputs.
+
+![Pangenome rarefaction](figures/pangenome_rarefaction.png)
+
+**Figure 1. Pangenome rarefaction curve.**
+*Total pangenome size (upper curve) and core genome size (lower curve) as a function of the number of genomes sampled. Shaded regions indicate variability across random genome orderings. The continued increase in total gene families indicates an open pangenome, while the gradual decline in core genes reflects increasing genetic diversity.*
+
+![Pangenome composition](figures/pangenome_composition.png)
+
+**Figure 2. Pangenome composition across prevalence categories.**
+*Gene families were classified into core (≥99%), soft-core (95–99%), shell (15–95%), and cloud (<15%) categories. The pangenome is dominated by low-frequency accessory genes, consistent with extensive horizontal gene transfer and lineage-specific gene content.*
 
 The inferred pangenome comprised **5,387 gene families** across 2,327 genomes.
-
-Key observations:
 - **682 gene families** exhibited allelic diversity (>1 allele)
 - **1,701 gene families** showed evidence of gene fission or fusion
 - **998 gene families** exhibited gene duplication or loss
@@ -143,13 +162,14 @@ Rare gene families dominate the accessory genome, consistent with an open pangen
 
 ---
 
-## Visualisation
+### Accessory genome structure
 
-```bash
-python3 pirate_plotting.py --pirate-out PIRATE_out --outdir pirate_plots --all --palette life_aquatic_blues
-```
+The structure of the accessory genome was explored using principal component analysis (PCA) based on presence–absence of accessory gene families.
 
-These plots summarise core/accessory structure, allelic diversity, and structural variation across the pangenome.
+![Accessory genome PCA](figures/accessory_pca.png)
+
+**Figure 3. Accessory genome PCA.**
+*Principal component analysis of accessory gene presence–absence reveals clear clustering, indicating non-random structure in accessory gene content consistent with lineage- and host-associated gene pools.*
 
 ---
 
@@ -181,29 +201,21 @@ python3 pirate_host_association.py \
 *Commentary:*
 Performing rarefaction independently within each host category controls for differences in sample size and avoids conflating biological signal with uneven sampling.
 
-### Results: host-associated pangenome dynamics
-
 Host-stratified accumulation curves reveal clear differences in pangenome structure between host-associated populations.
 
 ![Host-stratified gene family accumulation](figures/rarefaction_by_host.png)
 
-*Figure X. Host-stratified gene family accumulation curves showing pangenome (solid lines) and core genome (dashed lines) sizes as a function of the number of genomes sampled within each host category.*
+**Figure 4. Host-stratified gene family accumulation curves.**
+*Pangenome size (solid lines) and core genome size (dashed lines) plotted as a function of the number of genomes sampled within each host category. Shaded regions indicate variability across permutations.*
 
-Key observations:
+### Key observations:
 - All host groups exhibit open pangenomes, with the number of gene families continuing to increase as additional genomes are sampled.
 - Human-associated isolates show the largest and most rapidly expanding pangenome, even at large sample sizes (>1,000 genomes), with no evidence of saturation.
 - Bird-associated isolates show the most rapid core genome erosion, with the number of core gene families declining steeply as additional genomes are included.
 - Mammal-associated isolates display intermediate behaviour, with both pangenome growth and core genome contraction falling between human- and bird-associated populations.
 
-These patterns are robust across permutations and persist after controlling for sampling depth.
-
 *Interpretation:*
-The observed host-specific accumulation patterns suggest distinct evolutionary regimes across host-associated populations:
-- The expansive pangenome observed in human-associated isolates likely reflects greater ecological heterogeneity, repeated host switching, and admixture from multiple reservoir populations.
-- The rapid loss of core genes in bird-associated isolates is consistent with high lineage diversity and elevated gene turnover, potentially driven by frequent recombination and population structure within avian hosts.
-- Mammal-associated populations appear more constrained, suggesting narrower ecological niches or reduced opportunities for horizontal gene transfer.
-
-Importantly, these differences are not attributable to sampling artefacts and instead reflect genuine biological variation in genome evolution across host environments.
+These host-specific accumulation patterns suggest distinct evolutionary regimes. The expansive pangenome in human-associated isolates likely reflects ecological heterogeneity and repeated host switching, while the rapid core erosion in birds is consistent with elevated recombination and population structure in avian hosts.
 
 ---
 
