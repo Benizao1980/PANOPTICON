@@ -7,7 +7,7 @@ This document combines:
 - **inline commentary on observed results**, and
 - **reproducibility metadata**, including software versions and references.
 
-All analyses were performed on the full dataset and form the basis for downstream comparative, evolutionary, and host-association analyses.
+All analyses were performed on the full dataset and form the basis for downstream comparative, evolutionary, and host-association analyses, including recombination-aware phylogenetics and genome-wide association studies.
 
 ---
 
@@ -328,11 +328,7 @@ Outputs included:
 - recomb_regions.tsv – genomic coordinates of inferred recombination
 
 *Optional SVG visualisations were generated to illustrate recombination density along the genome.*
-
-
-*Optional:* also mask ancestral segments
-
-If you want to mask segments inferred on internal branches (not just leaf-specific “extant” imports), add:
+*Optional:* also mask ancestral segments inferred on internal branches (not just leaf-specific “extant” imports), add:
 
 ```
   --mask-ancestral
@@ -348,10 +344,9 @@ Masking ancestral segments is more aggressive and may be appropriate if your dow
 
 This masked alignment represents a recombination-aware substrate suitable for downstream evolutionary inference.
 
-## Downstream: phylogeny on recombination-masked alignment (recommended)
+## Downstream: phylogeny on recombination-masked alignment
 
 Once masking is complete, re-infer an ML tree on the masked alignment to obtain branch lengths/topology less driven by homologous recombination:
-
 ```bash
 iqtree2 \
   -s cfml_core_out/core_alignment.masked.fasta \
@@ -369,6 +364,252 @@ This “masked-core” tree is typically the best default for host-association, 
 
 ---
 
+## Genome-wide asociation with PYSEER (mammal isoaltes vs bird isolates)
+
+### Prepare PYSEER input files
+
+Make a patristic distance matrix from the masked tree
+```bash
+python - <<'EOF' > zang_core_masked.dist
+from ete3 import Tree
+import sys
+
+t = Tree("zang_core_masked.treefile", format=1)
+
+leaves = list(t.iter_leaves())
+names  = [leaf.name for leaf in leaves]
+n = len(leaves)
+
+print("\t" + "\t".join(names))
+
+for i, a in enumerate(leaves, 1):
+    if i % 50 == 0 or i in (1, n):
+        print(f"[progress] {i}/{n} rows", file=sys.stderr, flush=True)
+    row = [a.name]
+    for b in leaves:
+        row.append(str(t.get_distance(a, b)))  # node objects, not names
+    print("\t".join(row))
+EOF
+```
+
+OR Convert zang_core_masked.mldist → pyseer distance TSV
+
+Run this in the same folder as the .mldist:
+```
+python - <<'EOF'
+import sys
+
+infile  = "zang_core_masked.mldist"
+outfile = "zang_core_masked.dist.tsv"
+
+# Read PHYLIP distance matrix (first line n, then n rows: name + n floats)
+with open(infile) as f:
+    first = f.readline().strip()
+    n = int(first)
+    rows = []
+    names = []
+
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        name = parts[0]
+        vals = parts[1:]
+        # Some PHYLIP writers wrap rows across lines; IQ-TREE usually doesn't, but be safe:
+        while len(vals) < n:
+            nxt = f.readline()
+            if not nxt:
+                break
+            vals += nxt.strip().split()
+        if len(vals) != n:
+            raise ValueError(f"{name}: expected {n} distances, got {len(vals)}")
+        names.append(name)
+        rows.append(vals)
+
+if len(rows) != n:
+    raise ValueError(f"Expected {n} rows, got {len(rows)}")
+
+with open(outfile, "w") as out:
+    out.write("\t" + "\t".join(names) + "\n")
+    for name, vals in zip(names, rows):
+        out.write(name + "\t" + "\t".join(vals) + "\n")
+
+print(f"Wrote {outfile} ({n}x{n})", file=sys.stderr)
+EOF
+```
+
+Convert metadata file into .tsv file
+```bash
+python - <<'EOF'
+import pandas as pd
+
+df = pd.read_csv("phenotypes.csv")
+
+# normalise host labels
+df["Host"] = df["Host"].astype(str).str.strip().str.lower()
+
+# keep bird + mammal only
+df = df[df["Host"].isin(["birds", "mammal"])].copy()
+
+# phenotype: bird=1, mammal=0
+df["phenotype"] = (df["Host"] == "birds").astype(int)
+
+df[["id", "phenotype"]].to_csv(
+    "pyseer_birds_vs_mammal.pheno.tsv",
+    sep="\t",
+    index=False,
+    header=False
+)
+
+print("Wrote pyseer_birds_vs_mammal.pheno.tsv with", len(df), "samples")
+print(df["phenotype"].value_counts().rename({0:"mammal", 1:"birds"}))
+EOF
+```
+
+Sanity check: make sure phenotype IDs match your tree/dist IDs:
+```bash
+cut -f1 pyseer_birds_vs_mammal.pheno.tsv | sort > pheno.ids
+head -n 1 zang_core_masked.dist.tsv | tr '\t' '\n' | tail -n +2 | sort > dist.ids
+comm -3 pheno.ids dist.ids | head
+```
+
+### Run GWAS with genes, SNPs and unitigs
+
+#### Genes (presence/absence)
+
+We already have a PIRATE gene presence/absence matrix (PIRATE.gene_families.tsv), the quickest robust way is to convert it with a small Python helper.
+
+From the folder ~/.../Zang_cdtB
+```bash
+python - <<'EOF'
+import pandas as pd
+
+gene_file    = "PIRATE_out/PIRATE.gene_families.tsv"     # or .ordered.tsv
+pirate_genomes = "PIRATE_out/genome_list.txt"
+keep_samples = "pyseer/gwas.samples"
+out_pres     = "pyseer/pyseer_genes.pres"
+
+# Load lists
+pirate = [x.strip() for x in open(pirate_genomes) if x.strip()]
+keep   = set(x.strip() for x in open(keep_samples) if x.strip())
+
+# Read PIRATE table
+df = pd.read_csv(gene_file, sep="\t", dtype=str)
+gene_col = df.columns[0]
+
+# Use only genome columns that are in PIRATE genome list AND in your keep list
+genome_cols = [g for g in pirate if (g in df.columns and g in keep)]
+if not genome_cols:
+    raise SystemExit("No genome columns matched. Check isolate naming between PIRATE_out and gwas.samples")
+
+with open(out_pres, "w") as out:
+    for _, row in df.iterrows():
+        gene = row[gene_col]
+        for g in genome_cols:
+            v = row[g]
+            if pd.notna(v) and v != "." and v != "":
+                out.write(f"{gene}\t{g}\n")
+
+print(f"Wrote {out_pres}")
+print(f"Genomes used: {len(genome_cols)}")
+print(f"Gene families: {df.shape[0]}")
+EOF
+```
+
+Sanity check (this should now look right)
+```
+head -n 5 pyseer/pyseer_genes.pres
+cut -f2 pyseer/pyseer_genes.pres | sort -u | wc -l
+```
+Run gene presence/absence GWAS with a slurm script: 
+
+```slurm
+#!/bin/bash
+#SBATCH --job-name=pyseer_genes_BvM
+#SBATCH --output=slurm_logs/%x_%j.out
+#SBATCH --error=slurm_logs/%x_%j.err
+#SBATCH --account=cooperma
+#SBATCH --partition=standard
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=20
+#SBATCH --time=48:00:00
+#SBATCH --mem=120G
+
+set -euo pipefail
+
+export BASHRCSOURCED=1
+source ~/.bashrc
+conda activate pyseer
+
+WORKDIR="/groups/cooperma/bpascoe/Zang_cdtB"
+cd "$WORKDIR"
+
+mkdir -p slurm_logs pyseer
+
+PHENO="pyseer/pyseer_birds_vs_mammal.pheno.in_masked.tsv"
+PRES="pyseer/pyseer_genes.pres"
+DIST="pyseer/zang_core_masked.dist.tsv"
+OUT="pyseer/gwas_genes_birds_vs_mammal.lmm.tsv"
+
+# Sanity checks
+test -s "$PHENO"
+test -s "$PRES"
+test -s "$DIST"
+
+# Run
+pyseer \
+  --phenotypes "$PHENO" \
+  --pres "$PRES" \
+  --distances "$DIST" \
+  --lmm \
+  --mds classic --max-dimensions 10 \
+  --min-af 0.01 --max-af 0.99 \
+  --cpu "${SLURM_CPUS_PER_TASK}" \
+  > "$OUT"
+
+# Quick summary + Bonferroni threshold
+python - <<'EOF'
+import pandas as pd
+fn="pyseer/gwas_genes_birds_vs_mammal.lmm.tsv"
+df=pd.read_csv(fn, sep="\t")
+pcol = "lrt-pvalue" if "lrt-pvalue" in df.columns else ("pvalue" if "pvalue" in df.columns else None)
+print("rows:", len(df))
+if pcol:
+    bonf = 0.05/len(df) if len(df)>0 else None
+    print("pcol:", pcol)
+    print("bonferroni_0.05:", bonf)
+    if bonf:
+        print("n_sig:", (df[pcol] < bonf).sum())
+else:
+    print("No p-value column found. Columns:", df.columns.tolist())
+EOF
+
+```
+
+#### Run SNPs (VCF) GWAS
+```
+pyseer \
+  --phenotypes pyseer_bird_vs_mammal.pheno.tsv \
+  --vcf snps.vcf.gz \
+  --distances zang_core_masked.dist.tsv \
+  --mds classic --max-dimensions 10 \
+  --cpu 20 \
+  > pyseer_snps.tsv
+```
+
+#### Run Unitig-based GWAS
+```
+pyseer \
+  --phenotypes pyseer_bird_vs_mammal.pheno.tsv \
+  --kmers unitigs.txt.gz \
+  --distances zang_core_masked.dist.tsv \
+  --mds classic --max-dimensions 10 \
+  --cpu 20 \
+  > pyseer_unitigs.tsv
+```
+
+---
 ## Reproducibility, software versions, and resources
 
 All analyses were performed on an HPC cluster using SLURM.
@@ -388,7 +629,15 @@ All analyses were performed on an HPC cluster using SLURM.
 - FigShare link to genomes -
 - PubMLST shared proejct - 
 - microreact [tree](https://microreact.org/project/gy6keE6LWQ4As8neqw9Zwz-zang-and-pascoe-et-almammal-adaptation-in-c-jejuni)
-- Conda environments used throughout
+- Modular Conda environments used throughout, e.g.
+```
+conda create -n prokka -c conda-forge -c bioconda prokka=1.14
+conda create -n pirate -c conda-forge -c bioconda pirate
+conda create -n iqtree -c conda-forge -c bioconda iqtree=2.3.6
+conda create -n clonalframeml -c conda-forge -c bioconda clonalframeml
+conda create -n pyseer -c conda-forge -c bioconda \
+    pyseer ete3 pandas numpy scipy statsmodels scikit-learn
+```
 
 ### Please cite: 
 TBC <link to manuscript>
