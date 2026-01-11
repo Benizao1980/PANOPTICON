@@ -15,6 +15,14 @@ All analyses were performed on the full dataset and form the basis for downstrea
 
 The analysis comprised **2,327 whole-genome assemblies** derived from the *Zang et al.* dataset. These genomes represent isolates sampled across multiple host species and epidemiological contexts. All assemblies were processed using a uniform annotation and pangenome workflow to minimise technical artefacts.
 
+contigs are shared online at FigShare (doi: add) and can be downloaded: 
+
+```bash
+wget need to add link
+```
+
+Genomes and isolate data are also grouped as a collection on [pubMLST](add link)
+
 *Commentary:*  
 The large sample size and host diversity provide sufficient power to characterise both rare accessory genes and structural variation within highly prevalent (core) gene families.
 
