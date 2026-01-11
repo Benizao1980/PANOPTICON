@@ -790,17 +790,57 @@ EOF
 - Structure (fixed effects): ``pyseer/mds_components.tsv.pkl``
 - Samples list: ``pyseer/gwas.samples``
 
-What we need to generate:
-- Unitigs from the same core alignment or assemblies used for SNPs.
+Build a sample list using: 
+- ``pyseer/gwas.samples``
+- ``contigs in contigs/<ID>.fas``
 
-```
-unitig-counter \
-  --input contigs.list \
-  --output pyseer/unitigs.txt.gz \
-  --kmer-size 31
+```bash
+cd /groups/cooperma/bpascoe/Zang_cdtB
+python - <<'EOF'
+import os
+samples=[x.strip() for x in open("pyseer/gwas.samples") if x.strip()]
+paths=[]
+missing=[]
+for s in samples:
+    p=f"contigs/{s}.fas"
+    (paths if os.path.exists(p) else missing).append(p)
+open("pyseer/unitigs/paths.txt","w").write("\n".join(paths)+"\n")
+print("paths:",len(paths))
+print("missing:",len(missing))
+if missing: print("example missing:", missing[:5])
+EOF
 ```
 
-Then subset to samples if needed (often not required if names match).
+Build unitigs + presence/absence once
+
+```slurm
+#!/bin/bash
+#SBATCH --job-name=unitigs_call_k31
+#SBATCH --output=slurm_logs/%x_%j.out
+#SBATCH --error=slurm_logs/%x_%j.err
+#SBATCH --account=cooperma
+#SBATCH --partition=standard
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=48:00:00
+#SBATCH --mem=450G
+
+set -euo pipefail
+source ~/.bashrc
+conda activate unitig-caller
+
+cd /groups/cooperma/bpascoe/Zang_cdtB
+mkdir -p slurm_logs pyseer/unitigs_call
+
+unitig-caller \
+  --call \
+  --refs pyseer/unitigs/refs_962.txt \
+  --kmer 31 \
+  --out pyseer/unitigs_call/k31 \
+  --rtab
+```
+
+Run GWAS...
 
 ```
 pyseer \
