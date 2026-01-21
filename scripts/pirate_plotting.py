@@ -1,38 +1,34 @@
 #!/usr/bin/env python3
 """
-pirate_plotting.py
+pirate_plotting.py (version 2.5)
 
 Plotting helpers for PIRATE outputs (Campylobacter-scale datasets).
 Generates publication-ready summaries without requiring core alignments.
 
-Inputs expected in PIRATE_out:
+Expected in --pirate-out:
   - binary_presence_absence.fasta
+Optional (if present / requested):
   - PIRATE.gene_families.tsv
   - PIRATE.pangenome_summary.txt
 
 Dependencies:
-  - pandas
-  - numpy
-  - matplotlib
+  - pandas, numpy, matplotlib
   - scikit-learn
   - biopython
-
 Optional:
-  - umap-learn (for UMAP embedding)
+  - umap-learn
 
 Examples:
   python pirate_plotting.py --pirate-out PIRATE_out --outdir plots --all
-  python pirate_plotting.py --pirate-out PIRATE_out --outdir plots --pca --meta meta.tsv --meta-col host
+  python pirate_plotting.py --pirate-out PIRATE_out --outdir plots --pca --meta meta.txt --meta-col host
+  python pirate_plotting.py --pirate-out PIRATE_out --outdir plots --pca --meta meta.txt --meta-col host \
+    --group-colors "human_gastroenteritis=#9C2C2C,human_asymptomatic=#003B5C"
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
-import grp
 import os
-from random import seed
-import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -44,13 +40,12 @@ from Bio import SeqIO
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS
 from sklearn.metrics import pairwise_distances
+from sklearn.neighbors import NearestNeighbors
 
 
 # -----------------------------
-# Wes Anderson-inspired palettes
+# Palettes
 # -----------------------------
-# Note: These are "Life Aquatic"-inspired blues/teals (not a pixel-perfect extraction).
-# If you want exact hexes from a specific palette source, tell me which package/source you prefer.
 WES_PALETTES: Dict[str, List[str]] = {
     "life_aquatic_blues": [
         "#003B5C",  # deep navy
@@ -67,6 +62,8 @@ WES_PALETTES: Dict[str, List[str]] = {
     ],
 }
 
+DEFAULT_UNKNOWN_COLOR = "#BDBDBD"  # also used for REFERENCE unless overridden
+
 
 def get_palette(name: str) -> List[str]:
     if name not in WES_PALETTES:
@@ -81,9 +78,13 @@ def ensure_outdir(outdir: str) -> None:
     os.makedirs(outdir, exist_ok=True)
 
 
-def read_binary_presence_absence_fasta(path: str, pirate_out: Optional[str] = None) -> pd.DataFrame:
+def warn(msg: str) -> None:
+    print(f"[WARN] {msg}")
+
+
+def read_binary_presence_absence_fasta(path: str) -> pd.DataFrame:
     """
-    Reads PIRATE binary presence/absence FASTA into a dataframe:
+    Read PIRATE binary presence/absence FASTA into a dataframe:
       rows = genomes, cols = gene-family positions, values = 0/1 integers
 
     Supports PIRATE encodings:
@@ -95,76 +96,24 @@ def read_binary_presence_absence_fasta(path: str, pirate_out: Optional[str] = No
     if not records:
         raise ValueError(f"No records found in {path}")
 
-    def _decode_char(c: str) -> int:
-        c = c.upper()
-        if c in ("A", "0", "-", "N"):
-            return 0
-        if c in ("C", "1"):
-            return 1
-        # be conservative with anything unexpected
-        return 0
-
-    ids = []
-    arrs = []
+    ids: List[str] = []
+    arrs: List[np.ndarray] = []
     for r in records:
-        seq = str(r.seq).strip()
-        arr = np.fromiter((1 if c == "C" else 0 for c in seq), dtype=np.int8)
+        seq = str(r.seq).strip().upper()
+        # Map: C/1 -> 1, everything else -> 0 (A/0/-/N)
+        arr = np.fromiter((1 if c in ("C", "1") else 0 for c in seq), dtype=np.int8)
         ids.append(r.id)
         arrs.append(arr)
 
-    mat = np.vstack(arrs)  # (n_genomes x n_gene_families)
+    mat = np.vstack(arrs)
     df = pd.DataFrame(mat, index=ids)
     df.index.name = "sample"
     return df
 
-    # optional: expected genome IDs from genome_list.txt
-    expected_genomes = None
-    if pirate_out:
-        gl = os.path.join(pirate_out, "genome_list.txt")
-        if os.path.exists(gl):
-            with open(gl) as f:
-                expected_genomes = [ln.strip() for ln in f if ln.strip()]
-
-    # Decide orientation
-    ids_set = set(ids)
-    expected_set = set(expected_genomes) if expected_genomes is not None else None
-
-    # Case A: records are genomes
-    records_are_genomes = False
-    if expected_genomes is not None:
-        # either exact ID match, or count match and sequences are long (gene-families)
-        if len(ids_set & expected_set) > 0.8 * min(len(ids_set), len(expected_set)):
-            records_are_genomes = True
-        elif n_records == n_expected and seq_len != n_expected:
-            records_are_genomes = True
-
-    # Case B: sequences are across genomes -> transpose
-    transpose_needed = False
-    if expected_genomes is not None and not records_are_genomes:
-        if seq_len == n_expected:
-            transpose_needed = True
-
-    if transpose_needed:
-        # records=genes, positions=genomes
-        df = pd.DataFrame(mat.T, index=expected_genomes, columns=ids)
-        df.index.name = "sample"
-        return df
-
-    # default: treat records as genomes
-    df = pd.DataFrame(mat, index=ids)
-    df.index.name = "sample"
-    return df
 
 def read_gene_families_tsv(path: str) -> pd.DataFrame:
     return pd.read_csv(path, sep="\t")
 
-def filter_by_counts(df01: pd.DataFrame, min_count: int = 2, max_count: Optional[int] = None) -> pd.DataFrame:
-    n = df01.shape[0]
-    if max_count is None:
-        max_count = n - 2
-    counts = df01.sum(axis=0)
-    keep = (counts >= min_count) & (counts <= max_count)
-    return df01.loc[:, keep]
 
 def filter_variable_columns(df01: pd.DataFrame, min_var: float = 0.0) -> pd.DataFrame:
     """Drop gene families with zero variance (all 0 or all 1)."""
@@ -172,113 +121,133 @@ def filter_variable_columns(df01: pd.DataFrame, min_var: float = 0.0) -> pd.Data
     keep = v > min_var
     return df01.loc[:, keep]
 
-@dataclass
-class PangenomeSummary:
-    total_families: Optional[int] = None
-    core: Optional[int] = None
-    soft_core: Optional[int] = None
-    shell: Optional[int] = None
-    cloud: Optional[int] = None
-
-def compute_pangenome_bins_from_gene_families(
-    gene_families: pd.DataFrame,
-    n_genomes: int,
-    core: float = 0.99,
-    soft_core: float = 0.95,
-    shell: float = 0.15,
-) -> Dict[str, int]:
-    """
-    Compute core/soft-core/shell/cloud counts from PIRATE.gene_families.tsv
-    using frequency bins defined as fractions of total genomes.
-    """
-    col_candidates = [
-        "number_genomes",
-        "number_genome",
-        "No. isolates", "No. isolates ", "No_isolates",
-        "No. genomes", "No. Genomes",
-    ]
-
-    col = None
-    for c in col_candidates:
-        if c in gene_families.columns:
-            col = c
-            break
-    if col is None:
-        raise ValueError(f"Could not find isolates/genomes count column. Columns: {list(gene_families.columns)}")
-
-    freq = pd.to_numeric(gene_families[col], errors="coerce").dropna().astype(int)
-
-    core_thr = int(np.ceil(core * n_genomes))
-    soft_thr = int(np.ceil(soft_core * n_genomes))
-    shell_thr = int(np.ceil(shell * n_genomes))
-
-    counts = {
-        "Core (≥99%)": int((freq >= core_thr).sum()),
-        "Soft-core (95–99%)": int(((freq >= soft_thr) & (freq < core_thr)).sum()),
-        "Shell (15–95%)": int(((freq >= shell_thr) & (freq < soft_thr)).sum()),
-        "Cloud (<15%)": int((freq < shell_thr).sum()),
-    }
-    return counts
-
-
-def parse_pangenome_summary(path: str) -> PangenomeSummary:
-    """
-    Tries to parse PIRATE.pangenome_summary.txt for core/softcore/shell/cloud counts.
-    PIRATE formats vary slightly across versions; we use regex patterns.
-    """
-    txt = open(path, "r", encoding="utf-8", errors="replace").read()
-
-    def grab(patterns: List[str]) -> Optional[int]:
-        for pat in patterns:
-            m = re.search(pat, txt, flags=re.IGNORECASE | re.MULTILINE)
-            if m:
-                try:
-                    return int(m.group(1))
-                except Exception:
-                    continue
-        return None
-
-    summary = PangenomeSummary(
-        total_families=grab([
-            r"Total\s+gene\s+families:\s+(\d+)",
-            r"gene\s+families\s*=\s*(\d+)",
-            r"Total\s+families\s*:\s*(\d+)",
-        ]),
-        core=grab([
-            r"\bcore\b.*?:\s+(\d+)",
-            r"\bCore\s+families\b.*?:\s+(\d+)",
-        ]),
-        soft_core=grab([
-            r"soft[-\s]?core.*?:\s+(\d+)",
-            r"\bsoftcore\b.*?:\s+(\d+)",
-        ]),
-        shell=grab([
-            r"\bshell\b.*?:\s+(\d+)",
-        ]),
-        cloud=grab([
-            r"\bcloud\b.*?:\s+(\d+)",
-        ]),
-    )
-    return summary
-
 
 def load_metadata(meta_path: str, id_col: str = "sample") -> pd.DataFrame:
     """
-    Loads a metadata TSV/CSV (auto-detected by extension).
-    Must contain a column matching id_col that matches sample IDs in PIRATE outputs.
+    Loads a metadata TSV/CSV.
+    - .csv -> comma-separated
+    - otherwise -> tab-separated (meta.txt typical)
+    Values are loaded as strings to avoid mixed-type warnings.
     """
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(meta_path)
+
     if meta_path.endswith(".csv"):
-        df = pd.read_csv(meta_path)
+        df = pd.read_csv(meta_path, dtype=str)
     else:
-        df = pd.read_csv(meta_path, sep="\t")
+        df = pd.read_csv(meta_path, sep="\t", dtype=str)
+
     if id_col not in df.columns:
         raise ValueError(f"Metadata file must contain column '{id_col}'. Found: {list(df.columns)}")
+
     df = df.set_index(id_col)
     return df
 
 
 # -----------------------------
-# Plot helpers
+# Styling + legend utilities
+# -----------------------------
+def apply_matplotlib_style() -> None:
+    plt.rcParams.update({
+        "axes.linewidth": 1.2,
+        "xtick.major.width": 1.2,
+        "ytick.major.width": 1.2,
+        "font.size": 12,
+        "axes.titlesize": 18,
+        "axes.labelsize": 14,
+        "legend.fontsize": 12,
+        "legend.framealpha": 0.95,
+        "savefig.bbox": "tight",
+    })
+
+
+def parse_group_colors(s: Optional[str]) -> Dict[str, str]:
+    """
+    Parse "a=#RRGGBB,b=#RRGGBB" into dict.
+    Accepts commas and optional whitespace.
+    """
+    if not s:
+        return {}
+    out: Dict[str, str] = {}
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    for p in parts:
+        if "=" not in p:
+            continue
+        k, v = p.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def build_color_map(
+    labels: pd.Series,
+    palette: List[str],
+    group_colors: Dict[str, str],
+    unknown_label: str = "Unknown",
+) -> Tuple[pd.Series, Dict[str, str], List[str]]:
+    lab = labels.copy()
+    lab = lab.astype(str)
+    lab = lab.replace({"nan": np.nan, "None": np.nan})
+    lab = lab.where(lab.notna(), other=unknown_label)
+
+    levels = sorted(pd.unique(lab))
+    def _key(x: str) -> Tuple[int, str]:
+        if x == "REFERENCE":
+            return (0, x)
+        if x == unknown_label:
+            return (1, x)
+        return (2, x)
+
+    levels = sorted(levels, key=_key)
+
+    color_map: Dict[str, str] = {}
+    pal_i = 0
+    for lvl in levels:
+        if lvl in group_colors:
+            color_map[lvl] = group_colors[lvl]
+        elif lvl == "REFERENCE":
+            color_map[lvl] = group_colors.get("REFERENCE", DEFAULT_UNKNOWN_COLOR)
+        elif lvl == unknown_label:
+            color_map[lvl] = group_colors.get(unknown_label, DEFAULT_UNKNOWN_COLOR)
+        else:
+            color_map[lvl] = palette[pal_i % len(palette)]
+            pal_i += 1
+
+    return lab, color_map, levels
+
+
+def export_legend_only(
+    levels: List[str],
+    color_map: Dict[str, str],
+    title: str,
+    out_png: str,
+    marker: str = "o",
+    markersize: float = 10.0,
+) -> None:
+    fig = plt.figure(figsize=(6, max(2.5, 0.5 * len(levels))))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    handles = []
+    for lvl in levels:
+        handles.append(
+            plt.Line2D(
+                [0], [0],
+                marker=marker, linestyle="",
+                label=str(lvl),
+                markerfacecolor=color_map[lvl],
+                markeredgecolor="white",
+                markeredgewidth=0.9,
+                markersize=markersize,
+            )
+        )
+    ax.legend(handles=handles, title=title, loc="center left", frameon=True)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
+
+
+# -----------------------------
+# Core plots
 # -----------------------------
 def save_coords_csv(coords: np.ndarray, samples: List[str], out_csv: str, extra: Optional[pd.DataFrame] = None) -> None:
     df = pd.DataFrame(coords, index=samples, columns=["dim1", "dim2"])
@@ -287,155 +256,192 @@ def save_coords_csv(coords: np.ndarray, samples: List[str], out_csv: str, extra:
     df.to_csv(out_csv)
 
 
-def plot_scatter(
-    x: np.ndarray,
-    y: np.ndarray,
+def add_knn_edges(ax: plt.Axes, coords: np.ndarray, k: int = 8, alpha: float = 0.18, lw: float = 1.0) -> None:
+    if k is None or k <= 0:
+        return
+    if coords.shape[0] < 3:
+        return
+    nn = NearestNeighbors(n_neighbors=min(k + 1, coords.shape[0]), metric="euclidean")
+    nn.fit(coords)
+    inds = nn.kneighbors(coords, return_distance=False)
+    for i in range(coords.shape[0]):
+        for j in inds[i, 1:]:
+            ax.plot(
+                [coords[i, 0], coords[j, 0]],
+                [coords[i, 1], coords[j, 1]],
+                color="#CFCFCF",
+                alpha=alpha,
+                linewidth=lw,
+                zorder=1,
+            )
+
+
+def plot_scatter_pretty(
+    coords: np.ndarray,
     labels: Optional[pd.Series],
     palette: List[str],
     title: str,
     out_png: str,
     xlabel: str = "Dim 1",
     ylabel: str = "Dim 2",
-    point_size: float = 8.0,
+    group_colors: Optional[Dict[str, str]] = None,
+    legend_outside: bool = False,
+    knn_edges: int = 0,
+    point_size: float = 38.0,
+    point_alpha: float = 0.95,
+    legend_title: Optional[str] = None,
+    legend_out_png: Optional[str] = None,
 ) -> None:
-    plt.figure(figsize=(7, 6))
+    fig, ax = plt.subplots(figsize=(9.5, 6.8))
+
+    if knn_edges and knn_edges > 0:
+        add_knn_edges(ax, coords, k=knn_edges)
 
     if labels is None:
-        plt.scatter(x, y, s=point_size, c=palette[0])
+        ax.scatter(coords[:, 0], coords[:, 1], s=point_size, c=palette[0],
+                   edgecolors="white", linewidths=0.6, alpha=point_alpha, zorder=2)
     else:
-        cats = labels.astype("category")
-        levels = list(cats.cat.categories)
-        color_map = {lvl: palette[i % len(palette)] for i, lvl in enumerate(levels)}
-        colors = cats.map(color_map)
-        plt.scatter(x, y, s=point_size, c=colors)
+        group_colors = group_colors or {}
+        lab, cmap, levels = build_color_map(labels, palette, group_colors)
 
-        # Legend
-        handles = []
         for lvl in levels:
-            handles.append(plt.Line2D([0], [0], marker="o", linestyle="", label=str(lvl),
-                                      markerfacecolor=color_map[lvl], markeredgecolor=color_map[lvl], markersize=6))
-        plt.legend(handles=handles, title=labels.name or "group", loc="best", frameon=True)
+            idx = (lab == lvl).values
+            ax.scatter(
+                coords[idx, 0], coords[idx, 1],
+                s=point_size,
+                c=cmap[lvl],
+                edgecolors="white",
+                linewidths=0.6,
+                alpha=point_alpha,
+                label=str(lvl),
+                zorder=3,
+            )
 
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
-    plt.close()
+        if legend_outside:
+            ax.legend(
+                title=legend_title or (labels.name if labels is not None else "group"),
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                frameon=True,
+            )
+        else:
+            ax.legend(
+                title=legend_title or (labels.name if labels is not None else "group"),
+                loc="best",
+                frameon=True,
+            )
+
+        if legend_out_png:
+            export_legend_only(levels, cmap, title=legend_title or (labels.name or "group"), out_png=legend_out_png)
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
 
 
 def plot_gene_frequency_hist(gene_families: pd.DataFrame, out_png: str) -> None:
-    """
-    Plot histogram of gene family frequency (number of genomes containing each gene family).
-    """
     col_candidates = [
         "number_genomes",
         "number_genome",
         "No. isolates", "No. isolates ", "No_isolates",
         "No. genomes", "No. Genomes",
     ]
-
     col = None
     for c in col_candidates:
         if c in gene_families.columns:
             col = c
             break
-
     if col is None:
-        raise ValueError(
-            f"Could not find isolates/genomes count column in PIRATE.gene_families.tsv. "
-            f"Columns: {list(gene_families.columns)}"
-        )
+        raise ValueError(f"Could not find isolates/genomes count column. Columns: {list(gene_families.columns)}")
 
     if "threshold" in gene_families.columns:
-        gf95 = gene_families[gene_families["threshold"] == 95]
+        gf95 = gene_families[gene_families["threshold"].astype(str) == "95"]
         if len(gf95) > 0:
             gene_families = gf95
 
     freq = pd.to_numeric(gene_families[col], errors="coerce").dropna().astype(int)
 
-    plt.figure(figsize=(7, 4.5))
-    plt.hist(freq, bins=60)
-    plt.xlabel("Number of genomes containing gene family")
-    plt.ylabel("Number of gene families")
-    plt.title("Gene family frequency distribution")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
-    plt.close()
+    fig, ax = plt.subplots(figsize=(7.5, 4.8))
+    ax.hist(freq, bins=60)
+    ax.set_xlabel("Number of genomes containing gene family")
+    ax.set_ylabel("Number of gene families")
+    ax.set_title("Gene family frequency distribution")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
 
 
-def plot_pangenome_bars(summary: PangenomeSummary, out_png: str, palette: List[str]) -> None:
-    labels = []
-    values = []
+def compute_pangenome_bins_from_gene_families(
+    gene_families: pd.DataFrame,
+    n_genomes: int,
+    core: float = 0.99,
+    soft_core: float = 0.95,
+    shell: float = 0.15,
+) -> Dict[str, int]:
+    col_candidates = [
+        "number_genomes",
+        "number_genome",
+        "No. isolates", "No. isolates ", "No_isolates",
+        "No. genomes", "No. Genomes",
+    ]
+    col = None
+    for c in col_candidates:
+        if c in gene_families.columns:
+            col = c
+            break
+    if col is None:
+        raise ValueError(f"Could not find isolates/genomes count column. Columns: {list(gene_families.columns)}")
 
-    for name, val in [("Core", summary.core), ("Soft-core", summary.soft_core), ("Shell", summary.shell), ("Cloud", summary.cloud)]:
-        if val is not None:
-            labels.append(name)
-            values.append(val)
+    if "threshold" in gene_families.columns:
+        gf95 = gene_families[gene_families["threshold"].astype(str) == "95"]
+        if len(gf95) > 0:
+            gene_families = gf95
 
-    if not values:
-        raise ValueError("Could not parse core/soft-core/shell/cloud from PIRATE.pangenome_summary.txt. "
-                         "If you paste the top ~60 lines, I can add a parser for your exact format.")
+    freq = pd.to_numeric(gene_families[col], errors="coerce").dropna().astype(int)
 
-    plt.figure(figsize=(7, 4.5))
-    colors = [palette[i % len(palette)] for i in range(len(values))]
-    plt.bar(labels, values, color=colors)
-    plt.ylabel("Number of gene families")
-    plt.title("Pangenome composition")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
-    plt.close()
+    core_thr = int(np.ceil(core * n_genomes))
+    soft_thr = int(np.ceil(soft_core * n_genomes))
+    shell_thr = int(np.ceil(shell * n_genomes))
+
+    return {
+        "Core (≥99%)": int((freq >= core_thr).sum()),
+        "Soft-core (95–99%)": int(((freq >= soft_thr) & (freq < core_thr)).sum()),
+        "Shell (15–95%)": int(((freq >= shell_thr) & (freq < soft_thr)).sum()),
+        "Cloud (<15%)": int((freq < shell_thr).sum()),
+    }
 
 
-from typing import Dict, Optional
+def plot_pangenome_bars(bins: Dict[str, int], n_genomes: int, out_png: str, palette: List[str]) -> None:
+    labels_bar = list(bins.keys())
+    values_bar = list(bins.values())
+    colors = [palette[i % len(palette)] for i in range(len(values_bar))]
 
-def compute_rarefaction_curves_by_group(
-    df01: pd.DataFrame,
-    groups: pd.Series,
-    steps: int = 60,
-    reps: int = 20,
-    seed: int = 0,
-    min_group_size: int = 30,
-    max_groups: Optional[int] = None,
-) -> Dict[str, pd.DataFrame]:
-    
-    """
-    Compute rarefaction curves separately for each group in `groups`.
-    Returns dict: {group_name: curves_df}
-    """
-    
-    g = groups.reindex(df01.index)
+    fig, ax = plt.subplots(figsize=(7.5, 4.8))
+    ax.bar(labels_bar, values_bar, color=colors)
+    ax.set_ylabel("Number of gene families")
+    ax.set_title(f"Pangenome composition (n={n_genomes} genomes)")
+    ax.set_xticklabels(labels_bar, rotation=20, ha="right")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
 
-    # drop missing group labels
-    keep = g.notna()
-    df01 = df01.loc[keep]
-    g = g.loc[keep].astype(str)
 
-    # order groups by size (desc), filter by min size
-    sizes = g.value_counts()
-    sizes = sizes[sizes >= min_group_size]
-    if max_groups is not None:
-        sizes = sizes.iloc[:max_groups]
-
-    out: Dict[str, pd.DataFrame] = {}
-    for grp in sizes.index:
-        sub = df01.loc[g == grp]
-        out[grp] = compute_rarefaction_curves(
-            sub, steps=steps, reps=reps, seed=seed
-        )
-    return out
-
+# -----------------------------
+# Rarefaction
+# -----------------------------
 def compute_rarefaction_curves(
     df01: pd.DataFrame,
     steps: int = 60,
     reps: int = 20,
     seed: int = 0,
 ) -> pd.DataFrame:
-
     rng = np.random.default_rng(seed)
     n = df01.shape[0]
 
-    # choose genome counts to evaluate (dense early, coarser later)
     if steps >= n:
         ks = np.arange(1, n + 1)
     else:
@@ -449,14 +455,9 @@ def compute_rarefaction_curves(
     for r in range(reps):
         order = rng.permutation(n)
         Xp = X[order, :]
-
-        # cumulative sums across genomes
-        csum = np.cumsum(Xp, axis=0)  # shape: (n, genes)
-
+        csum = np.cumsum(Xp, axis=0)
         for j, k in enumerate(ks):
-            # pan: genes seen at least once
             pan_mat[r, j] = int((csum[k - 1, :] > 0).sum())
-            # core: genes present in all k genomes so far
             core_mat[r, j] = int((csum[k - 1, :] == k).sum())
 
     def summarise(mat: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -468,11 +469,36 @@ def compute_rarefaction_curves(
     pan_mean, pan_lo, pan_hi = summarise(pan_mat)
     core_mean, core_lo, core_hi = summarise(core_mat)
 
-    out = pd.DataFrame({
+    return pd.DataFrame({
         "n_genomes": ks,
         "pan_mean": pan_mean, "pan_lo": pan_lo, "pan_hi": pan_hi,
         "core_mean": core_mean, "core_lo": core_lo, "core_hi": core_hi,
     })
+
+
+def compute_rarefaction_curves_by_group(
+    df01: pd.DataFrame,
+    groups: pd.Series,
+    steps: int = 60,
+    reps: int = 20,
+    seed: int = 0,
+    min_group_size: int = 30,
+    max_groups: Optional[int] = None,
+) -> Dict[str, pd.DataFrame]:
+    g = groups.reindex(df01.index)
+    keep = g.notna()
+    df01 = df01.loc[keep]
+    g = g.loc[keep].astype(str)
+
+    sizes = g.value_counts()
+    sizes = sizes[sizes >= min_group_size]
+    if max_groups is not None:
+        sizes = sizes.iloc[:max_groups]
+
+    out: Dict[str, pd.DataFrame] = {}
+    for grp in sizes.index:
+        sub = df01.loc[g == grp]
+        out[grp] = compute_rarefaction_curves(sub, steps=steps, reps=reps, seed=seed)
     return out
 
 
@@ -481,97 +507,86 @@ def plot_rarefaction(
     out_png: str,
     palette: List[str],
     title: str = "Gene family accumulation (PIRATE)",
+    legend_outside: bool = False,
 ) -> None:
-    """
-    Plot pan (increasing) and core (decreasing) rarefaction curves with 95% CI.
-    """
-    plt.figure(figsize=(7.5, 5.5))
-
+    fig, ax = plt.subplots(figsize=(7.8, 6.2))
     x = curves["n_genomes"].values
+    pan_c = palette[1]
+    core_c = palette[0]
 
-    # pick two blues from the palette
-    pan_c = palette[1]   # teal-ish
-    core_c = palette[0]  # deep navy
+    ax.plot(x, curves["pan_mean"].values, linewidth=3, color=pan_c, label="Pangenome (total)")
+    ax.fill_between(x, curves["pan_lo"].values, curves["pan_hi"].values, alpha=0.20, color=pan_c)
 
-    # pangenome
-    plt.plot(x, curves["pan_mean"].values, linewidth=2, color=pan_c, label="Pangenome (total)")
-    plt.fill_between(x, curves["pan_lo"].values, curves["pan_hi"].values, alpha=0.20, color=pan_c)
+    ax.plot(x, curves["core_mean"].values, linewidth=3, color=core_c, label="Core (present in all)")
+    ax.fill_between(x, curves["core_lo"].values, curves["core_hi"].values, alpha=0.20, color=core_c)
 
-    # core genome
-    plt.plot(x, curves["core_mean"].values, linewidth=2, color=core_c, label="Core (present in all)")
-    plt.fill_between(x, curves["core_lo"].values, curves["core_hi"].values, alpha=0.20, color=core_c)
+    ax.set_xlabel("Number of genomes")
+    ax.set_ylabel("Number of gene families")
+    ax.set_title(title)
 
-    plt.xlabel("Number of genomes")
-    plt.ylabel("Number of gene families")
-    plt.title(title)
-    plt.legend(frameon=True, loc="best")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
-    plt.close()
+    if legend_outside:
+        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
+    else:
+        ax.legend(frameon=True, loc="best")
+
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
+
 
 def plot_rarefaction_by_group(
     curves_by_group: Dict[str, pd.DataFrame],
     out_png: str,
     palette: List[str],
+    group_colors: Optional[Dict[str, str]] = None,
     title: str = "Gene family accumulation by group",
     include_core: bool = False,
+    legend_outside: bool = False,
 ) -> None:
-    plt.figure(figsize=(8.5, 6.0))
+    group_colors = group_colors or {}
+    fig, ax = plt.subplots(figsize=(8.8, 6.4))
 
-    for i, (grp, dfc) in enumerate(curves_by_group.items()):
-        c = palette[i % len(palette)]
+    ordered = list(curves_by_group.keys())
+
+    for i, grp in enumerate(ordered):
+        dfc = curves_by_group[grp]
+        c = group_colors.get(grp, palette[i % len(palette)])
         x = dfc["n_genomes"].values
 
-        # pangenome
-        plt.plot(x, dfc["pan_mean"].values, linewidth=3.0, color=c, label=grp)
-        plt.fill_between(x, dfc["pan_lo"].values, dfc["pan_hi"].values, alpha=0.18, color=c)
+        ax.plot(x, dfc["pan_mean"].values, linewidth=3.5, color=c, label=grp)
+        ax.fill_between(x, dfc["pan_lo"].values, dfc["pan_hi"].values, alpha=0.18, color=c)
 
-        # optional core (dashed)
         if include_core:
-            plt.plot(x, dfc["core_mean"].values, linewidth=2.2, color=c, linestyle="--", alpha=0.9)
+            ax.plot(x, dfc["core_mean"].values, linewidth=2.5, color=c, linestyle="--", alpha=0.9)
 
-    plt.xlabel("Number of isolates")
-    plt.ylabel("Number of gene families")
-    plt.title(title)
-    plt.legend(title="Group", frameon=True, loc="best")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
-    plt.close()
+    ax.set_xlabel("Number of isolates")
+    ax.set_ylabel("Number of gene families")
+    ax.set_title(title)
 
+    if legend_outside:
+        ax.legend(title="Group", loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
+    else:
+        ax.legend(title="Group", frameon=True, loc="best")
 
-def filter_accessory(df01: pd.DataFrame, min_freq: float = 0.01, max_freq: float = 0.99) -> pd.DataFrame:
-    # freq of presence per gene family
-    freq = df01.mean(axis=0)
-    keep = (freq >= min_freq) & (freq <= max_freq)
-    out = df01.loc[:, keep]
-    # also drop any remaining zero-variance cols (belt + braces)
-    out = out.loc[:, out.var(axis=0) > 0]
-    return out
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
 
 
 # -----------------------------
-# Analyses
+# Embeddings + diagnostics
 # -----------------------------
 def run_pca_accessory(df01: pd.DataFrame, n_components: int = 2) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    PCA on presence/absence matrix.
-    Returns coords (n x 2) and explained variance ratios.
-    """
     pca = PCA(n_components=n_components, random_state=0)
     coords = pca.fit_transform(df01.values)
     return coords, pca.explained_variance_ratio_
 
 
 def run_mds_jaccard(df01: pd.DataFrame) -> np.ndarray:
-    """
-    Metric MDS on Jaccard distances of presence/absence (good for accessory structure).
-    """
-    # Jaccard distance expects boolean
     X = df01.values.astype(bool)
     dist = pairwise_distances(X, metric="jaccard")
     mds = MDS(n_components=2, dissimilarity="precomputed", random_state=0, n_init=4, max_iter=300)
-    coords = mds.fit_transform(dist)
-    return coords
+    return mds.fit_transform(dist)
 
 
 def run_umap(df01: pd.DataFrame, n_neighbors: int = 15, min_dist: float = 0.1) -> np.ndarray:
@@ -579,195 +594,74 @@ def run_umap(df01: pd.DataFrame, n_neighbors: int = 15, min_dist: float = 0.1) -
         import umap  # type: ignore
     except ImportError as e:
         raise ImportError("UMAP requested but umap-learn is not installed. Install with: conda install -c conda-forge umap-learn") from e
-
     reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=min_dist, metric="jaccard", random_state=0)
-    coords = reducer.fit_transform(df01.values.astype(bool))
-    return coords
+    return reducer.fit_transform(df01.values.astype(bool))
 
-
-# -----------------------------
-# Extra diagnostics
-# -----------------------------
 
 def gene_counts_per_genome(df01: pd.DataFrame) -> pd.Series:
-    """
-    Number of gene families present per genome.
-    """
     counts = df01.sum(axis=1)
     counts.name = "gene_count"
     return counts
 
 
 def plot_gene_count_distribution(gene_counts: pd.Series, out_png: str) -> None:
-    plt.figure(figsize=(7, 4.5))
-    plt.hist(gene_counts, bins=50)
-    plt.xlabel("Number of gene families per genome")
-    plt.ylabel("Number of genomes")
-    plt.title("Gene content per genome")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
-    plt.close()
+    fig, ax = plt.subplots(figsize=(7.5, 4.8))
+    ax.hist(gene_counts, bins=50)
+    ax.set_xlabel("Number of gene families per genome")
+    ax.set_ylabel("Number of genomes")
+    ax.set_title("Gene content per genome")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
 
 
-def plot_pca_vs_gene_count(
-    coords: np.ndarray,
-    gene_counts: pd.Series,
-    out_png: str,
-    var: Tuple[float, float],
-) -> None:
-    plt.figure(figsize=(7, 6))
-    sc = plt.scatter(
-        coords[:, 0],
-        coords[:, 1],
-        c=gene_counts.values,
-        cmap="viridis",
-        s=10
-    )
-    plt.xlabel(f"PC1 ({var[0]*100:.1f}%)")
-    plt.ylabel(f"PC2 ({var[1]*100:.1f}%)")
-    plt.title("Accessory PCA coloured by gene count")
-    plt.colorbar(sc, label="Genes per genome")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
-    plt.close()
+def plot_pca_vs_gene_count(coords: np.ndarray, gene_counts: pd.Series, out_png: str, var: Tuple[float, float]) -> None:
+    fig, ax = plt.subplots(figsize=(7.6, 6.4))
+    sc = ax.scatter(coords[:, 0], coords[:, 1], c=gene_counts.values, cmap="viridis", s=14)
+    ax.set_xlabel(f"PC1 ({var[0]*100:.1f}%)")
+    ax.set_ylabel(f"PC2 ({var[1]*100:.1f}%)")
+    ax.set_title("Accessory PCA coloured by gene count")
+    fig.colorbar(sc, ax=ax, label="Genes per genome")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
 
 
-def plot_top_variance_heatmap(
-    df01: pd.DataFrame,
-    top_n: int,
-    out_png: str,
-) -> None:
-    """
-    Heatmap of top N most variable gene families.
-    """
+def plot_top_variance_heatmap(df01: pd.DataFrame, top_n: int, out_png: str) -> None:
     variances = df01.var(axis=0)
     top_cols = variances.sort_values(ascending=False).head(top_n).index
     mat = df01[top_cols]
 
-    plt.figure(figsize=(12, 6))
-    plt.imshow(mat.T, aspect="auto", interpolation="nearest", cmap="viridis")
-    plt.colorbar(label="Presence (0/1)")
-    plt.xlabel("Genomes")
-    plt.ylabel(f"Top {top_n} variable gene families")
-    plt.title(f"Top {top_n} variable gene families (presence/absence)")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
-    plt.close()
-
-def fst_per_gene_nei(df01: pd.DataFrame, groups: pd.Series, min_group_size: int = 20) -> pd.DataFrame:
-    """
-    df01: rows=samples, cols=genes, values 0/1
-    groups: index aligned to df01.index, values=group labels
-    Returns: DataFrame with columns: gene, fst, ht, hs, n_groups, n_total
-    """
-    g = groups.reindex(df01.index)
-    keep = g.notna()
-    X = df01.loc[keep]
-    g = g.loc[keep].astype(str)
-
-    # keep only groups with enough samples
-    sizes = g.value_counts()
-    good = sizes[sizes >= min_group_size].index
-    keep2 = g.isin(good)
-    X = X.loc[keep2]
-    g = g.loc[keep2]
-
-    if len(good) < 2:
-        raise ValueError("Need >=2 groups passing --fst-min-group-size to compute FST.")
-
-    # weights
-    sizes = g.value_counts().sort_index()
-    w = (sizes / sizes.sum()).to_dict()
-
-    # per-group frequencies p_i (vector per gene)
-    # build p_i matrix: rows=groups, cols=genes
-    p = []
-    for grp in sizes.index:
-        p.append(X.loc[g == grp].mean(axis=0).values)
-    P = np.vstack(p)  # shape (G, M)
-    W = np.array([w[grp] for grp in sizes.index]).reshape(-1, 1)
-
-    # Hs: weighted mean within-group heterozygosity
-    H_i = 2 * P * (1 - P)
-    Hs = (W * H_i).sum(axis=0)
-
-    # Ht: heterozygosity of pooled frequency
-    pbar = (W * P).sum(axis=0)
-    Ht = 2 * pbar * (1 - pbar)
-
-    # fst
-    fst = np.zeros_like(Ht)
-    mask = Ht > 0
-    fst[mask] = (Ht[mask] - Hs[mask]) / Ht[mask]
-    fst = np.clip(fst, 0, 1)
-
-    out = pd.DataFrame({
-        "gene": X.columns,
-        "fst": fst,
-        "ht": Ht,
-        "hs": Hs,
-        "n_groups": len(sizes),
-        "n_total": int(sizes.sum()),
-    })
-    return out.sort_values("fst", ascending=False).reset_index(drop=True)
-
-
-def fst_pairwise_per_gene_nei(df01: pd.DataFrame, groups: pd.Series, min_group_size: int = 20) -> pd.DataFrame:
-    """
-    Returns a long table: gene, group_a, group_b, fst
-    """
-    g = groups.reindex(df01.index)
-    keep = g.notna()
-    X = df01.loc[keep]
-    g = g.loc[keep].astype(str)
-
-    sizes = g.value_counts()
-    good = sizes[sizes >= min_group_size].index
-    X = X.loc[g.isin(good)]
-    g = g.loc[g.isin(good)]
-
-    labs = sorted(g.unique())
-    rows = []
-    for i in range(len(labs)):
-        for j in range(i + 1, len(labs)):
-            a, b = labs[i], labs[j]
-            Xa = X.loc[g == a]
-            Xb = X.loc[g == b]
-            pa = Xa.mean(axis=0).values
-            pb = Xb.mean(axis=0).values
-
-            wa = Xa.shape[0] / (Xa.shape[0] + Xb.shape[0])
-            wb = 1 - wa
-
-            Hs = wa * (2 * pa * (1 - pa)) + wb * (2 * pb * (1 - pb))
-            pbar = wa * pa + wb * pb
-            Ht = 2 * pbar * (1 - pbar)
-
-            fst = np.zeros_like(Ht)
-            mask = Ht > 0
-            fst[mask] = (Ht[mask] - Hs[mask]) / Ht[mask]
-            fst = np.clip(fst, 0, 1)
-
-            rows.append(pd.DataFrame({"gene": X.columns, "group_a": a, "group_b": b, "fst": fst}))
-    return pd.concat(rows, ignore_index=True)
-
+    fig, ax = plt.subplots(figsize=(12, 6))
+    im = ax.imshow(mat.T, aspect="auto", interpolation="nearest", cmap="viridis")
+    fig.colorbar(im, ax=ax, label="Presence (0/1)")
+    ax.set_xlabel("Genomes")
+    ax.set_ylabel(f"Top {top_n} variable gene families")
+    ax.set_title(f"Top {top_n} variable gene families (presence/absence)")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
 
 
 # -----------------------------
-# CLI
+# CLI runner with skip/summary
 # -----------------------------
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="Plot PIRATE summaries + accessory structure (Campy-friendly).")
     ap.add_argument("--pirate-out", required=True, help="Path to PIRATE_out directory")
     ap.add_argument("--outdir", default="pirate_plots", help="Output directory for plots")
-    ap.add_argument("--palette", default="life_aquatic_blues", help=f"Wes palette name: {', '.join(WES_PALETTES.keys())}")
+    ap.add_argument("--palette", default="life_aquatic_blues", help=f"Palette: {', '.join(WES_PALETTES.keys())}")
 
-    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--all", action="store_true",
+                    help="Run the standard suite of outputs (matches historical default outputs).")
+
     ap.add_argument("--pca", action="store_true")
     ap.add_argument("--mds", action="store_true")
     ap.add_argument("--umap", action="store_true")
+
     ap.add_argument("--gene-freq", action="store_true")
     ap.add_argument("--pangenome-bars", action="store_true")
+
     ap.add_argument("--gene-counts", action="store_true")
     ap.add_argument("--pca-gene-count", action="store_true")
     ap.add_argument("--heatmap-top", type=int, default=None)
@@ -778,13 +672,10 @@ def main():
     ap.add_argument("--rare-seed", type=int, default=0)
 
     ap.add_argument("--rarefaction-by", default=None,
-                help="Metadata column to stratify rarefaction curves (e.g. host). Requires --meta.")
-    ap.add_argument("--min-group-size", type=int, default=30,
-                help="Minimum isolates per group to plot (default 30).")
-    ap.add_argument("--max-groups", type=int, default=None,
-                help="Optionally cap number of groups plotted (largest first).")
-    ap.add_argument("--rarefaction-core", action="store_true",
-                help="Also plot core curves (dashed) for each group (can get busy).")
+                    help="Metadata column to stratify rarefaction curves (e.g. host). Requires --meta.")
+    ap.add_argument("--min-group-size", type=int, default=30)
+    ap.add_argument("--max-groups", type=int, default=None)
+    ap.add_argument("--rarefaction-core", action="store_true")
 
     ap.add_argument("--meta", default=None)
     ap.add_argument("--meta-id-col", default="sample")
@@ -793,19 +684,21 @@ def main():
     ap.add_argument("--umap-n-neighbors", type=int, default=15)
     ap.add_argument("--umap-min-dist", type=float, default=0.1)
 
-    ap.add_argument("--fst", action="store_true", help="Export per-gene FST by metadata group (presence/absence loci).")
-    ap.add_argument("--fst-by", default=None, help="Metadata column for groups (e.g. host). Requires --meta.")
-    ap.add_argument("--fst-min-group-size", type=int, default=20)
-    ap.add_argument("--fst-min-freq", type=float, default=0.01, help="Global min frequency for genes included.")
-    ap.add_argument("--fst-max-freq", type=float, default=0.99, help="Global max frequency for genes included.")
-    ap.add_argument("--fst-pairwise", action="store_true", help="Also output pairwise FST per gene (bigger files).")
-    
+    ap.add_argument("--group-colors", default=None)
+    ap.add_argument("--legend-outside", action="store_true")
+    ap.add_argument("--legend-out", default=None)
+    ap.add_argument("--knn-edges", type=int, default=0)
+
     args = ap.parse_args()
+
+    apply_matplotlib_style()
 
     pirate_out = args.pirate_out.rstrip("/")
     outdir = args.outdir
     ensure_outdir(outdir)
+
     palette = get_palette(args.palette)
+    group_colors = parse_group_colors(args.group_colors)
 
     if args.all:
         args.pangenome_bars = True
@@ -817,210 +710,273 @@ def main():
         args.heatmap_top = 200
         args.rarefaction = True
 
-    # -------------------------
-    # Optional metadata
-    # -------------------------
-    meta_df = None
-    labels = None
-    extra = None
-    if args.meta and args.meta_col:
-        meta_df = load_metadata(args.meta, id_col=args.meta_id_col)
-        if args.meta_col not in meta_df.columns:
-            raise ValueError(f"Metadata column '{args.meta_col}' not found. Available: {list(meta_df.columns)}")
-        labels = meta_df[args.meta_col]
-        labels.name = args.meta_col
+    ran: List[str] = []
+    skipped: List[str] = []
 
-    # -------------------------
-    # Load gene families table (only if needed)
-    # -------------------------
-    gf = None
+    meta_df: Optional[pd.DataFrame] = None
+    labels: Optional[pd.Series] = None
+    extra: Optional[pd.DataFrame] = None
+
+    if args.meta:
+        try:
+            meta_df = load_metadata(args.meta, id_col=args.meta_id_col)
+            extra = meta_df
+            if args.meta_col:
+                if args.meta_col not in meta_df.columns:
+                    warn(f"Metadata column '{args.meta_col}' not found; available: {list(meta_df.columns)}")
+                else:
+                    labels = meta_df[args.meta_col]
+                    labels.name = args.meta_col
+        except Exception as e:
+            warn(f"Failed to load metadata '{args.meta}': {e}")
+            meta_df = None
+            labels = None
+            extra = None
+
+    gf: Optional[pd.DataFrame] = None
     gf_path = os.path.join(pirate_out, "PIRATE.gene_families.tsv")
     if args.pangenome_bars or args.gene_freq:
-        gf = read_gene_families_tsv(gf_path)
+        if os.path.exists(gf_path):
+            try:
+                gf = read_gene_families_tsv(gf_path)
+            except Exception as e:
+                warn(f"Could not read {gf_path}: {e}")
+                gf = None
+        else:
+            warn(f"Missing {gf_path}; pangenome bars / gene frequency will be skipped.")
+            gf = None
 
-    # -------------------------
-    # Load binary presence/absence (A/C) whenever needed
-    # -------------------------
     need_df01 = (
         args.pca or args.mds or args.umap or args.gene_counts or args.pca_gene_count
         or (args.heatmap_top is not None) or args.rarefaction
     )
 
-    df01 = None
+    df01: Optional[pd.DataFrame] = None
     bin_path = os.path.join(pirate_out, "binary_presence_absence.fasta")
     if need_df01:
         if not os.path.exists(bin_path):
-            raise FileNotFoundError(f"Missing: {bin_path}")
-        # IMPORTANT: this must map A->0 and C->1 (your data are A/C)
-        df01 = read_binary_presence_absence_fasta(bin_path, pirate_out=pirate_out)
-
-        # Align metadata (if present)
-        if meta_df is not None and args.meta_col:
-            labels = labels.reindex(df01.index)
-            extra = meta_df.reindex(df01.index)
-
-        # Drop constant columns (all-0 or all-1)
-        df01 = filter_variable_columns(df01)
-
-        if df01.shape[1] < 2:
-            raise ValueError(
-                "After filtering, <2 variable gene families remain.\n"
-                "This usually means you loaded the matrix incorrectly.\n"
-                "Given your FASTA is A/C, ensure A->0 and C->1 decoding is active."
-            )
-
-    def apply_matplotlib_style():
-        plt.rcParams.update({
-            "axes.linewidth": 1.2,
-            "xtick.major.width": 1.2,
-            "ytick.major.width": 1.2,
-            "xtick.minor.width": 1.0,
-            "ytick.minor.width": 1.0,
-            "font.size": 12,
-            "axes.titlesize": 16,
-            "axes.labelsize": 13,
-            "legend.fontsize": 11,
-            "legend.framealpha": 0.95,
-            "savefig.bbox": "tight",
-        })
-
-    apply_matplotlib_style()
-    
-    # -------------------------
-    # Rarefaction curves
-    # -------------------------
-    if args.rarefaction:
-        # df01 is guaranteed loaded here
-        curves = compute_rarefaction_curves(df01, steps=args.rare_steps, reps=args.rare_reps, seed=args.rare_seed)
-        curves.to_csv(os.path.join(outdir, "pangenome_rarefaction.csv"), index=False)
-        plot_rarefaction(
-            curves,
-            os.path.join(outdir, "pangenome_rarefaction.png"),
-            palette,
-            title="Gene family accumulation (Campylobacter PIRATE)"
-        )
-
-    if args.rarefaction:
-        curves = compute_rarefaction_curves(df01, steps=args.rare_steps, reps=args.rare_reps, seed=args.rare_seed)
-        plot_rarefaction(curves, os.path.join(outdir, "pangenome_rarefaction.png"), palette,
-                        title="Gene family accumulation (Campylobacter PIRATE)")
-
-        # Stratified curves
-        if args.rarefaction_by:
-            if meta_df is None:
-                raise ValueError("--rarefaction-by requires --meta")
-            if args.rarefaction_by not in meta_df.columns:
-                raise ValueError(f"--rarefaction-by '{args.rarefaction_by}' not found in metadata columns")
-        
-        grp_series = meta_df[args.rarefaction_by].reindex(df01.index)
-        curves_by = compute_rarefaction_curves_by_group(
-            df01,
-            grp_series,
-            steps=args.rare_steps,
-            reps=args.rare_reps,
-            seed=args.rare_seed,
-            min_group_size=args.min_group_size,
-            max_groups=args.max_groups,
-        )
-        plot_rarefaction_by_group(
-            curves_by,
-            os.path.join(outdir, f"pangenome_rarefaction_by_{args.rarefaction_by}.png"),
-            palette,
-            title=f"Gene family accumulation by {args.rarefaction_by}",
-            include_core=args.rarefaction_core,
-        )
-
-    if args.fst:
-        if meta_df is None or args.fst_by is None:
-            raise ValueError("--fst requires --meta and --fst-by (e.g. host)")
-
-        grp = meta_df[args.fst_by].reindex(df01.index)
-
-        # frequency filter (accessory-ish)
-        freq = df01.mean(axis=0)
-        df_fst = df01.loc[:, (freq >= args.fst_min_freq) & (freq <= args.fst_max_freq)]
-
-        fst_table = fst_per_gene_nei(df_fst, grp, min_group_size=args.fst_min_group_size)
-        fst_table.to_csv(os.path.join(outdir, f"fst_per_gene_by_{args.fst_by}.tsv"),
-                         sep="\t", index=False)
-    if args.fst_pairwise:
-        fst_pw = fst_pairwise_per_gene_nei(df_fst, grp, min_group_size=args.fst_min_group_size)
-        fst_pw.to_csv(os.path.join(outdir, f"fst_pairwise_per_gene_by_{args.fst_by}.tsv"),
-                      sep="\t", index=False)
-
-
-    # -------------------------
-    # Pangenome composition bars
-    # -------------------------
-    if args.pangenome_bars:
-        if df01 is not None:
-            n_genomes = df01.shape[0]
+            warn(f"Missing {bin_path}; PCA/MDS/UMAP/rarefaction/diagnostics will be skipped.")
+            df01 = None
         else:
-            n_genomes = int(pd.to_numeric(gf["number_genomes"], errors="coerce").max())
+            try:
+                df01 = read_binary_presence_absence_fasta(bin_path)
+                df01 = filter_variable_columns(df01)
+                if df01.shape[1] < 2:
+                    warn("After filtering, <2 variable gene families remain; skipping embeddings.")
+                    df01 = None
+            except Exception as e:
+                warn(f"Failed to load binary presence/absence FASTA: {e}")
+                df01 = None
 
-        bins = compute_pangenome_bins_from_gene_families(gf, n_genomes)
-        plt.figure(figsize=(7, 4.5))
-        labels_bar = list(bins.keys())
-        values_bar = list(bins.values())
-        colors = [palette[i % len(palette)] for i in range(len(values_bar))]
-        plt.bar(labels_bar, values_bar, color=colors)
-        plt.ylabel("Number of gene families")
-        plt.title(f"Pangenome composition (n={n_genomes} genomes)")
-        plt.xticks(rotation=20, ha="right")
-        plt.tight_layout()
-        plt.savefig(os.path.join(outdir, "pangenome_composition.png"), dpi=300)
-        plt.close()
-        pd.Series(bins).to_csv(os.path.join(outdir, "pangenome_composition_counts.csv"))
+    if df01 is not None and meta_df is not None:
+        extra = meta_df.reindex(df01.index)
+        if labels is not None:
+            labels = labels.reindex(df01.index)
 
-    # -------------------------
-    # Gene frequency histogram
-    # -------------------------
+    if args.rarefaction:
+        if df01 is None:
+            skipped.append("rarefaction (overall): missing binary_presence_absence.fasta")
+        else:
+            curves = compute_rarefaction_curves(df01, steps=args.rare_steps, reps=args.rare_reps, seed=args.rare_seed)
+            out_csv = os.path.join(outdir, "pangenome_rarefaction.csv")
+            out_png = os.path.join(outdir, "pangenome_rarefaction.png")
+            curves.to_csv(out_csv, index=False)
+            plot_rarefaction(curves, out_png, palette,
+                             title="Gene family accumulation (Campylobacter PIRATE)",
+                             legend_outside=args.legend_outside)
+            ran.append(f"rarefaction (overall): {os.path.basename(out_csv)}, {os.path.basename(out_png)}")
+
+            if args.rarefaction_by:
+                if meta_df is None:
+                    skipped.append(f"rarefaction by '{args.rarefaction_by}': missing/invalid --meta")
+                elif args.rarefaction_by not in meta_df.columns:
+                    skipped.append(f"rarefaction by '{args.rarefaction_by}': column not in metadata")
+                else:
+                    grp_series = meta_df[args.rarefaction_by].reindex(df01.index)
+                    curves_by = compute_rarefaction_curves_by_group(
+                        df01,
+                        grp_series,
+                        steps=args.rare_steps,
+                        reps=args.rare_reps,
+                        seed=args.rare_seed,
+                        min_group_size=args.min_group_size,
+                        max_groups=args.max_groups,
+                    )
+                    out_png2 = os.path.join(outdir, f"pangenome_rarefaction_by_{args.rarefaction_by}.png")
+                    plot_rarefaction_by_group(
+                        curves_by,
+                        out_png2,
+                        palette,
+                        group_colors=group_colors,
+                        title=f"Gene family accumulation by {args.rarefaction_by}",
+                        include_core=args.rarefaction_core,
+                        legend_outside=args.legend_outside,
+                    )
+                    ran.append(f"rarefaction by '{args.rarefaction_by}': {os.path.basename(out_png2)}")
+    else:
+        skipped.append("rarefaction (overall): flag not set")
+
+    if args.pangenome_bars:
+        if gf is None:
+            skipped.append("pangenome composition bars: missing PIRATE.gene_families.tsv")
+        else:
+            n_genomes = df01.shape[0] if df01 is not None else 0
+            try:
+                bins = compute_pangenome_bins_from_gene_families(gf, n_genomes)
+                out_png = os.path.join(outdir, "pangenome_composition.png")
+                out_counts = os.path.join(outdir, "pangenome_composition_counts.csv")
+                plot_pangenome_bars(bins, n_genomes, out_png, palette)
+                pd.Series(bins).to_csv(out_counts)
+                ran.append(f"pangenome composition bars: {os.path.basename(out_png)}, {os.path.basename(out_counts)}")
+            except Exception as e:
+                warn(f"Failed to compute pangenome bins: {e}")
+                skipped.append("pangenome composition bars: parse/compute error")
+    else:
+        skipped.append("pangenome composition bars: flag not set")
+
     if args.gene_freq:
-        plot_gene_frequency_hist(gf, os.path.join(outdir, "gene_frequency_hist.png"))
+        if gf is None:
+            skipped.append("gene frequency histogram: missing PIRATE.gene_families.tsv")
+        else:
+            try:
+                out_png = os.path.join(outdir, "gene_frequency_hist.png")
+                plot_gene_frequency_hist(gf, out_png)
+                ran.append(f"gene frequency histogram: {os.path.basename(out_png)}")
+            except Exception as e:
+                warn(f"Failed to plot gene frequency histogram: {e}")
+                skipped.append("gene frequency histogram: plot error")
+    else:
+        skipped.append("gene frequency histogram: flag not set")
 
-    # -------------------------
-    # Diagnostics + embeddings
-    # -------------------------
-    if df01 is not None:
+    if df01 is None:
+        if args.gene_counts:
+            skipped.append("gene count per genome: missing binary_presence_absence.fasta")
+        if args.heatmap_top is not None:
+            skipped.append("top variable genes heatmap: missing binary_presence_absence.fasta")
+        if args.pca:
+            skipped.append("accessory PCA: missing binary_presence_absence.fasta")
+        if args.mds:
+            skipped.append("accessory MDS: missing binary_presence_absence.fasta")
+        if args.umap:
+            skipped.append("accessory UMAP: missing binary_presence_absence.fasta")
+        if args.pca_gene_count:
+            skipped.append("accessory PCA coloured by gene count: missing binary_presence_absence.fasta")
+    else:
         gene_counts = gene_counts_per_genome(df01)
 
         if args.gene_counts:
-            plot_gene_count_distribution(gene_counts, os.path.join(outdir, "gene_count_per_genome.png"))
+            out_png = os.path.join(outdir, "gene_count_per_genome.png")
+            plot_gene_count_distribution(gene_counts, out_png)
+            ran.append(f"gene count per genome: {os.path.basename(out_png)}")
+        else:
+            skipped.append("gene count per genome: flag not set")
 
         if args.heatmap_top is not None:
-            plot_top_variance_heatmap(df01, top_n=args.heatmap_top,
-                                      out_png=os.path.join(outdir, f"top_{args.heatmap_top}_variable_genes_heatmap.png"))
+            out_png = os.path.join(outdir, f"top_{args.heatmap_top}_variable_genes_heatmap.png")
+            plot_top_variance_heatmap(df01, top_n=args.heatmap_top, out_png=out_png)
+            ran.append(f"top variable genes heatmap: {os.path.basename(out_png)}")
+        else:
+            skipped.append("top variable genes heatmap: flag not set")
 
         if args.pca:
             coords, var = run_pca_accessory(df01)
-            save_coords_csv(coords, df01.index.tolist(), os.path.join(outdir, "accessory_pca_coords.csv"), extra=extra)
-
-            plot_scatter(coords[:, 0], coords[:, 1], labels, palette,
-                         title=f"Accessory genome PCA (PC1 {var[0]*100:.1f}%, PC2 {var[1]*100:.1f}%)",
-                         out_png=os.path.join(outdir, "accessory_pca.png"),
-                         xlabel="PC1", ylabel="PC2")
+            out_csv = os.path.join(outdir, "accessory_pca_coords.csv")
+            save_coords_csv(coords, df01.index.tolist(), out_csv, extra=extra)
+            out_png = os.path.join(outdir, "accessory_pca.png")
+            plot_scatter_pretty(
+                coords,
+                labels=labels,
+                palette=palette,
+                title=f"Accessory genome PCA (PC1 {var[0]*100:.1f}%, PC2 {var[1]*100:.1f}%)",
+                out_png=out_png,
+                xlabel="PC1",
+                ylabel="PC2",
+                group_colors=group_colors,
+                legend_outside=args.legend_outside,
+                knn_edges=args.knn_edges,
+                legend_out_png=args.legend_out,
+            )
+            ran.append(f"accessory PCA: {os.path.basename(out_csv)}, {os.path.basename(out_png)}")
 
             if args.pca_gene_count:
-                plot_pca_vs_gene_count(coords, gene_counts,
-                                       os.path.join(outdir, "accessory_pca_gene_count.png"),
-                                       (float(var[0]), float(var[1])))
+                out_png2 = os.path.join(outdir, "accessory_pca_gene_count.png")
+                plot_pca_vs_gene_count(coords, gene_counts, out_png2, (float(var[0]), float(var[1])))
+                ran.append(f"accessory PCA coloured by gene count: {os.path.basename(out_png2)}")
+            else:
+                skipped.append("accessory PCA coloured by gene count: flag not set")
+        else:
+            skipped.append("accessory PCA: flag not set")
+            if args.pca_gene_count:
+                skipped.append("accessory PCA coloured by gene count: requires --pca")
 
         if args.mds:
             coords = run_mds_jaccard(df01)
-            save_coords_csv(coords, df01.index.tolist(), os.path.join(outdir, "accessory_mds_coords.csv"), extra=extra)
-            plot_scatter(coords[:, 0], coords[:, 1], labels, palette,
-                         title="Accessory genome MDS (Jaccard distance)",
-                         out_png=os.path.join(outdir, "accessory_mds.png"),
-                         xlabel="MDS1", ylabel="MDS2")
+            out_csv = os.path.join(outdir, "accessory_mds_coords.csv")
+            save_coords_csv(coords, df01.index.tolist(), out_csv, extra=extra)
+            out_png = os.path.join(outdir, "accessory_mds.png")
+            plot_scatter_pretty(
+                coords,
+                labels=labels,
+                palette=palette,
+                title="Accessory genome MDS (Jaccard distance)",
+                out_png=out_png,
+                xlabel="MDS1",
+                ylabel="MDS2",
+                group_colors=group_colors,
+                legend_outside=args.legend_outside,
+                knn_edges=args.knn_edges,
+                legend_out_png=args.legend_out,
+            )
+            ran.append(f"accessory MDS: {os.path.basename(out_csv)}, {os.path.basename(out_png)}")
+        else:
+            skipped.append("accessory MDS: flag not set")
 
         if args.umap:
-            coords = run_umap(df01, n_neighbors=args.umap_n_neighbors, min_dist=args.umap_min_dist)
-            save_coords_csv(coords, df01.index.tolist(), os.path.join(outdir, "accessory_umap_coords.csv"), extra=extra)
-            plot_scatter(coords[:, 0], coords[:, 1], labels, palette,
-                         title=f"Accessory genome UMAP (Jaccard; n={args.umap_n_neighbors}, min_dist={args.umap_min_dist})",
-                         out_png=os.path.join(outdir, "accessory_umap.png"),
-                         xlabel="UMAP1", ylabel="UMAP2")
+            try:
+                coords = run_umap(df01, n_neighbors=args.umap_n_neighbors, min_dist=args.umap_min_dist)
+                out_csv = os.path.join(outdir, "accessory_umap_coords.csv")
+                save_coords_csv(coords, df01.index.tolist(), out_csv, extra=extra)
+                out_png = os.path.join(outdir, "accessory_umap.png")
+                plot_scatter_pretty(
+                    coords,
+                    labels=labels,
+                    palette=palette,
+                    title=f"Accessory genome UMAP (Jaccard; n={args.umap_n_neighbors}, min_dist={args.umap_min_dist})",
+                    out_png=out_png,
+                    xlabel="UMAP1",
+                    ylabel="UMAP2",
+                    group_colors=group_colors,
+                    legend_outside=args.legend_outside,
+                    knn_edges=args.knn_edges,
+                    legend_out_png=args.legend_out,
+                )
+                ran.append(f"accessory UMAP: {os.path.basename(out_csv)}, {os.path.basename(out_png)}")
+            except Exception as e:
+                warn(str(e))
+                skipped.append("accessory UMAP: missing dependency (umap-learn) or runtime error")
+        else:
+            skipped.append("accessory UMAP: flag not set")
 
+    print("\n" + "=" * 72)
+    print("PIRATE plotting summary")
+    print("=" * 72)
+
+    print(f"Ran: {len(ran)}")
+    for x in ran:
+        print(f"  - {x}")
+
+    seen = set()
+    skipped_u = []
+    for s in skipped:
+        if s not in seen:
+            skipped_u.append(s)
+            seen.add(s)
+
+    print(f"\nSkipped: {len(skipped_u)}")
+    for x in skipped_u:
+        print(f"  - {x}")
+
+    print("=" * 72)
     print(f"Done. Outputs written to: {outdir}")
 
 
