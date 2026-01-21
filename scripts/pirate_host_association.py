@@ -35,7 +35,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Dict, List, Tuple, Optional
+import re
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -48,11 +49,15 @@ from Bio import SeqIO
 # -----------------------------
 WES_SUPERSET = [
     # A broad “Wes-ish” mix (blues/teals + warm accents + muted neutrals)
-    "#003B5C", "#005F73", "#0A9396", "#94D2BD", "#A8DADC", "#457B9D",
-    "#E9D8A6", "#EE9B00", "#CA6702", "#BB3E03", "#AE2012",
-    "#5B1A1A", "#9C2C2C", "#D04E4E", "#F2B5B5", "#F7EDE2",
+    "#EE9B00", "#9C2C2C", "#003B5C", "#005F73",
+    "#0A9396", "#94D2BD", "#A8DADC", "#457B9D",
+    "#E9D8A6", "#CA6702", "#BB3E03", "#AE2012",
+    "#5B1A1A", "#D04E4E", "#F2B5B5", "#F7EDE2",
     "#3E4E50", "#BFD7EA", "#2A9D8F", "#264653",
 ]
+
+HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{6})$")
+
 
 def set_plot_style():
     plt.rcParams.update({
@@ -71,27 +76,71 @@ def set_plot_style():
     })
 
 
+def parse_group_colors(spec: Optional[str]) -> Dict[str, str]:
+    """
+    Parse 'LEVEL=#RRGGBB,LEVEL2=#RRGGBB' into a dict.
+    Whitespace is tolerated around tokens.
+
+    Example:
+      --group-colors "Human (gastroenteritis)=#E66101,Chicken (commercial)=#E6AB02"
+    """
+    if not spec:
+        return {}
+    out: Dict[str, str] = {}
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(
+                f"Invalid --group-colors entry '{chunk}'. Expected format LEVEL=#RRGGBB"
+            )
+        level, hexcol = chunk.split("=", 1)
+        level = level.strip()
+        hexcol = hexcol.strip()
+        if not level:
+            raise ValueError(f"Invalid --group-colors entry '{chunk}': empty level name")
+        if not HEX_RE.match(hexcol):
+            raise ValueError(
+                f"Invalid HEX colour '{hexcol}' for level '{level}'. Expected #RRGGBB"
+            )
+        out[level] = hexcol
+    return out
+
+
+def pick_group_color(group_level: str, i: int, group_color_map: Dict[str, str]) -> str:
+    """
+    If an explicit mapping exists for this group level, use it; otherwise use WES_SUPERSET.
+    """
+    if group_level in group_color_map:
+        return group_color_map[group_level]
+    return WES_SUPERSET[i % len(WES_SUPERSET)]
+
+
 # -----------------------------
 # IO
 # -----------------------------
 def ensure_outdir(outdir: str) -> None:
     os.makedirs(outdir, exist_ok=True)
 
+
 def load_metadata(meta_path: str, id_col: str = "sample") -> pd.DataFrame:
     read_kwargs = dict(dtype=str)  # keep IDs stable
     if meta_path.endswith(".csv"):
         meta = pd.read_csv(meta_path, encoding="utf-8", encoding_errors="replace", **read_kwargs)
     else:
+        # .tsv, .txt, etc assumed tab-delimited unless user provides csv
         meta = pd.read_csv(meta_path, sep="\t", encoding="utf-8", encoding_errors="replace", **read_kwargs)
 
     if id_col not in meta.columns:
         raise ValueError(f"Metadata must contain '{id_col}'. Found: {list(meta.columns)}")
     return meta.set_index(id_col)
 
+
 def read_binary_presence_absence_fasta(path: str) -> pd.DataFrame:
     """
     PIRATE binary_presence_absence.fasta:
-      - records are genomes (your grep shows 2327 records)
+      - records are genomes
       - sequence alphabet: A/C (A=0, C=1)
 
     Returns:
@@ -138,13 +187,16 @@ def bh_fdr(pvals: np.ndarray) -> np.ndarray:
     out[order] = np.clip(q, 0, 1)
     return out
 
+
 def filter_by_prevalence(df01: pd.DataFrame, min_prev: float, max_prev: float) -> pd.DataFrame:
     prev = df01.mean(axis=0).values
     keep = (prev >= min_prev) & (prev <= max_prev)
     out = df01.loc[:, keep]
     if out.shape[1] < 2:
-        raise ValueError("After prevalence filtering, <2 features remain. "
-                         "Try relaxing --min-prevalence/--max-prevalence.")
+        raise ValueError(
+            "After prevalence filtering, <2 features remain. "
+            "Try relaxing --min-prevalence/--max-prevalence."
+        )
     return out
 
 
@@ -191,6 +243,7 @@ def rarefaction_curve(
         "core_mean": core_mean, "core_lo": core_lo, "core_hi": core_hi,
     })
 
+
 def plot_rarefaction_per_group(
     df01: pd.DataFrame,
     meta: pd.DataFrame,
@@ -201,8 +254,10 @@ def plot_rarefaction_per_group(
     seed: int,
     min_group_n: int,
     truncate_to_min: bool = False,
+    group_color_map: Optional[Dict[str, str]] = None,
 ) -> None:
     set_plot_style()
+    group_color_map = group_color_map or {}
 
     # align
     meta2 = meta.reindex(df01.index)
@@ -221,29 +276,27 @@ def plot_rarefaction_per_group(
     for g in groups:
         idx = meta2.index[meta2[group_col] == g]
         X = df01.loc[idx].values
-        curves[g] = rarefaction_curve(X, steps=steps, reps=reps, seed=seed)
+        curves[str(g)] = rarefaction_curve(X, steps=steps, reps=reps, seed=seed)
         ns.append(len(idx))
 
-    if truncate_to_min:
-        x_max = min(ns)
-    else:
-        x_max = None
+    x_max = min(ns) if truncate_to_min else None
 
     plt.figure(figsize=(8.5, 6.2))
     for i, g in enumerate(groups):
-        c = WES_SUPERSET[i % len(WES_SUPERSET)]
-        cur = curves[g].copy()
+        g_str = str(g)
+        c = pick_group_color(g_str, i, group_color_map)
+        cur = curves[g_str].copy()
 
         if x_max is not None:
             cur = cur[cur["n_genomes"] <= x_max]
 
         x = cur["n_genomes"].values
         # Pangenome line
-        plt.plot(x, cur["pan_mean"].values, color=c, label=f"{g} (pan)", alpha=0.95)
+        plt.plot(x, cur["pan_mean"].values, color=c, label=f"{g_str} (pan)", alpha=0.95)
         plt.fill_between(x, cur["pan_lo"].values, cur["pan_hi"].values, color=c, alpha=0.15)
 
         # Core-within-host line (same colour, dashed)
-        plt.plot(x, cur["core_mean"].values, color=c, linestyle="--", label=f"{g} (core)", alpha=0.95)
+        plt.plot(x, cur["core_mean"].values, color=c, linestyle="--", label=f"{g_str} (core)", alpha=0.95)
         plt.fill_between(x, cur["core_lo"].values, cur["core_hi"].values, color=c, alpha=0.10)
 
     plt.xlabel(f"Number of genomes (within {group_col})")
@@ -272,7 +325,6 @@ def cmh_for_feature(
     Implements CMH chi-square test with continuity correction.
     Assumes 2x2 within each stratum.
     """
-    # Map strata to integer groups
     uniq = pd.unique(strata)
     or_num = 0.0
     or_den = 0.0
@@ -309,18 +361,13 @@ def cmh_for_feature(
         or_den += (b * c) / n
 
         # CMH chi-square components
-        # E[a] = (row1 * col1) / n
         row1 = a + b
         col1 = a + c
         e_a = (row1 * col1) / n
 
-        # Var[a] = (row1*row0*col1*col0) / (n^2*(n-1))
         row0 = c + d
         col0 = b + d
-        if n > 1:
-            var_a = (row1 * row0 * col1 * col0) / (n**2 * (n - 1.0))
-        else:
-            var_a = 0.0
+        var_a = (row1 * row0 * col1 * col0) / (n**2 * (n - 1.0)) if n > 1 else 0.0
 
         sum_a_minus_e += (a - e_a)
         var_sum += var_a
@@ -331,24 +378,20 @@ def cmh_for_feature(
     else:
         or_cmh = or_num / or_den
 
-    # p-value from chi-square(1)
+    # p-value from chi-square(1), via normal approximation
     if var_sum <= 0:
         return or_cmh, 1.0
 
-    # continuity correction
-    num = (abs(sum_a_minus_e) - 0.5)**2
+    num = (abs(sum_a_minus_e) - 0.5)**2  # continuity correction
     chi2 = num / var_sum
 
-    # Chi-square survival function for df=1 (no scipy): p = exp(-chi2/2) * sqrt(...) is messy
-    # Use normal approximation: chi2(1) == Z^2 with Z ~ N(0,1)
-    z = np.sqrt(max(chi2, 0.0))
-    # two-sided p from normal:
-    # p = 2*(1 - Phi(z)) ; Phi(z) via erf
     from math import erf, sqrt
+    z = np.sqrt(max(chi2, 0.0))
     phi = 0.5 * (1.0 + erf(z / sqrt(2.0)))
     p = 2.0 * (1.0 - phi)
     p = float(np.clip(p, 0.0, 1.0))
     return or_cmh, p
+
 
 def run_host_association(
     df01: pd.DataFrame,
@@ -384,7 +427,6 @@ def run_host_association(
     for g in groups:
         y = (meta2[group_col].astype(str).values == str(g)).astype(np.uint8)
 
-        # skip if trivial
         if y.sum() < min_group_n:
             continue
 
@@ -400,7 +442,7 @@ def run_host_association(
 
         res = pd.DataFrame({
             "group_col": group_col,
-            "group_level": g,
+            "group_level": str(g),
             "structure_col": structure_col,
             "feature": features,
             "or_cmh": ors,
@@ -419,7 +461,9 @@ def run_host_association(
 # CLI
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Host association + per-group accumulation curves for PIRATE presence/absence.")
+    ap = argparse.ArgumentParser(
+        description="Host association + per-group accumulation curves for PIRATE presence/absence."
+    )
     ap.add_argument("--pirate-out", required=True)
     ap.add_argument("--meta", required=True)
     ap.add_argument("--meta-id-col", default="sample")
@@ -439,7 +483,17 @@ def main():
     ap.add_argument("--rare-reps", type=int, default=20)
     ap.add_argument("--rare-seed", type=int, default=0)
 
-    ap.add_argument("--assoc", action="store_true", help="Run CMH host association (group vs rest), stratified by structure")
+    ap.add_argument(
+        "--assoc",
+        action="store_true",
+        help="Run CMH host association (group vs rest), stratified by structure",
+    )
+
+    ap.add_argument(
+        "--group-colors",
+        default=None,
+        help='Optional: pin colours for specific group levels. Format: "LEVEL=#RRGGBB,LEVEL2=#RRGGBB"',
+    )
 
     args = ap.parse_args()
     ensure_outdir(args.outdir)
@@ -450,9 +504,11 @@ def main():
 
     meta = load_metadata(args.meta, id_col=args.meta_id_col)
 
+    # Optional colour map for group levels
+    group_color_map = parse_group_colors(args.group_colors)
+
     # Load PIRATE matrix and align to metadata
     df01 = read_binary_presence_absence_fasta(bin_fa)
-    # keep only samples with metadata
     df01 = df01.loc[df01.index.intersection(meta.index)]
 
     if df01.shape[0] < 10:
@@ -461,9 +517,15 @@ def main():
     if args.rarefaction_per_group:
         out_png = os.path.join(args.outdir, f"rarefaction_by_{args.group_col}.png")
         plot_rarefaction_per_group(
-            df01, meta, group_col=args.group_col, out_png=out_png,
-            reps=args.rare_reps, steps=args.rare_steps, seed=args.rare_seed,
-            min_group_n=args.min_group_n, truncate_to_min=args.truncate_to_min
+            df01, meta,
+            group_col=args.group_col,
+            out_png=out_png,
+            reps=args.rare_reps,
+            steps=args.rare_steps,
+            seed=args.rare_seed,
+            min_group_n=args.min_group_n,
+            truncate_to_min=args.truncate_to_min,
+            group_color_map=group_color_map,
         )
 
     if args.assoc:
@@ -483,3 +545,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
