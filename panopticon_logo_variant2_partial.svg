@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="120" viewBox="0 0 360 120" role="img" aria-label="PANOPTICON logo (partial field)">
+  <defs>
+    <style>
+      .bg { fill:#000; }
+      .stroke { fill:none; stroke-linecap:square; stroke-linejoin:miter; }
+      .w { stroke:#fff; }
+      .b { stroke:#4E79A7; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="6" y="6" width="348" height="108"/>
+  <rect class="stroke w" x="14" y="14" width="332" height="92" stroke-width="2"/>
+
+  <!-- Partial field of view (cropped rectangle) -->
+  <rect class="stroke b" x="96" y="32" width="180" height="56" stroke-width="6"/>
+  <rect class="stroke w" x="112" y="44" width="148" height="32" stroke-width="3"/>
+
+  <!-- Observation ticks -->
+  <g opacity="0.7">
+    <path class="stroke w" d="M186 20 V32" stroke-width="2"/>
+    <path class="stroke w" d="M186 88 V100" stroke-width="2"/>
+    <path class="stroke w" d="M92 60 H104" stroke-width="2"/>
+    <path class="stroke w" d="M256 60 H268" stroke-width="2"/>
+  </g>
+
+  <!-- Structural markers -->
+  <g>
+    <rect x="168" y="54" width="10" height="10" fill="#fff"/>
+    <rect x="182" y="54" width="10" height="10" fill="#4E79A7"/>
+    <rect x="196" y="54" width="10" height="10" fill="#fff"/>
+  </g>
+
+  <!-- Micro labels -->
+  <g opacity="0.6">
+    <rect x="24" y="22" width="30" height="2" fill="#fff"/>
+    <rect x="24" y="26" width="20" height="2" fill="#fff"/>
+  </g>
+</svg>
