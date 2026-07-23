@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: PANOPTICON
+type: software
+message: "Please cite PANOPTICON and the upstream pangenome software used in your analysis."
+authors:
+  - family-names: Pascoe
+    given-names: Ben
+repository-code: "https://github.com/Benizao1980/PANOPTICON"
+version: 0.2.0
+license: "NOASSERTION"

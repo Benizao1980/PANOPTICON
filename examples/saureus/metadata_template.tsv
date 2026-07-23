@@ -1,0 +1,4 @@
+id	host	host_group	ecology_group	country	collection_date	ST	CC	study
+sample_001	pig	pig	livestock	Poland	2020	ST398	CC398	new_collection
+sample_002	wild boar	wild_boar	wildlife	Poland	2020	ST398	CC398	new_collection
+sample_003	cow	cattle	livestock	Poland	2019	ST97	CC97	public_study

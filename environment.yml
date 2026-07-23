@@ -1,0 +1,22 @@
+name: panopticon
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - pandas
+  - numpy
+  - scipy
+  - matplotlib
+  - scikit-learn
+  - scikit-bio
+  - biopython
+  - statsmodels
+  - dendropy
+  - ete3
+  - umap-learn
+  - svgwrite
+  - upsetplot
+  - networkx
+  - pillow
+  - pytest
