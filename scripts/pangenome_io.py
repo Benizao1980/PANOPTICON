@@ -33,6 +33,7 @@ import argparse
 import csv
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
@@ -262,6 +263,26 @@ def read_panaroo_family_metadata(
     return meta
 
 
+
+def make_minimal_panaroo_family_metadata(
+    presence_absence: pd.DataFrame,
+) -> pd.DataFrame:
+    """Create family metadata when Panaroo CSV annotations are unavailable."""
+    counts = presence_absence.sum(axis=0).astype(int)
+    meta = pd.DataFrame(index=presence_absence.columns.copy())
+    meta.index.name = "gene_family"
+    meta["gene_family"] = meta.index.astype(str)
+    meta["gene_name"] = pd.NA
+    meta["annotation"] = pd.NA
+    meta["n_genomes"] = counts.reindex(meta.index).fillna(0).astype(int)
+    meta["prevalence"] = _safe_fraction(
+        meta["n_genomes"],
+        presence_absence.shape[0],
+    )
+    meta["source_tool"] = "panaroo"
+    return meta
+
+
 def parse_panaroo_summary(
     path: Optional[Path],
     presence_absence: pd.DataFrame,
@@ -300,21 +321,72 @@ def load_panaroo(
     prefer_rtab: bool = True,
     csv_chunksize: int = 500,
 ) -> PangenomeData:
-    csv_path = _first_existing(outdir, ["gene_presence_absence.csv"])
+    """Load Panaroo output, allowing Rtab-only partial output directories."""
     rtab_path = _first_existing(
         outdir,
         ["gene_presence_absence.Rtab", "gene_presence_absence.rtab"],
         required=False,
     )
+    csv_path = _first_existing(
+        outdir,
+        ["gene_presence_absence.csv"],
+        required=False,
+    )
 
     if prefer_rtab and rtab_path is not None:
         pa = read_panaroo_rtab(rtab_path)
+        matrix_source = rtab_path.name
+    elif csv_path is not None:
+        pa = read_panaroo_csv_presence_absence(
+            csv_path,
+            chunksize=csv_chunksize,
+        )
+        matrix_source = csv_path.name
+    elif rtab_path is not None:
+        pa = read_panaroo_rtab(rtab_path)
+        matrix_source = rtab_path.name
+        print(
+            "WARNING: gene_presence_absence.csv is unavailable or empty; "
+            "falling back to gene_presence_absence.Rtab.",
+            file=sys.stderr,
+        )
     else:
-        pa = read_panaroo_csv_presence_absence(csv_path, chunksize=csv_chunksize)
+        raise FileNotFoundError(
+            "No usable Panaroo matrix found. Expected a non-empty "
+            "gene_presence_absence.Rtab or gene_presence_absence.csv "
+            f"in {outdir}."
+        )
 
-    metadata = read_panaroo_family_metadata(csv_path, pa)
-    summary_path = _first_existing(outdir, ["summary_statistics.txt"], required=False)
+    if csv_path is not None:
+        try:
+            metadata = read_panaroo_family_metadata(csv_path, pa)
+            annotation_source = csv_path.name
+        except (ValueError, pd.errors.EmptyDataError, OSError) as exc:
+            print(
+                "WARNING: Panaroo CSV annotations could not be read "
+                f"({exc}). Continuing with minimal family metadata.",
+                file=sys.stderr,
+            )
+            metadata = make_minimal_panaroo_family_metadata(pa)
+            annotation_source = "minimal_from_presence_absence"
+    else:
+        metadata = make_minimal_panaroo_family_metadata(pa)
+        annotation_source = "minimal_from_presence_absence"
+        print(
+            "WARNING: gene_presence_absence.csv is unavailable or empty. "
+            "Gene names and annotations will be omitted.",
+            file=sys.stderr,
+        )
+
+    summary_path = _first_existing(
+        outdir,
+        ["summary_statistics.txt"],
+        required=False,
+    )
     summary = parse_panaroo_summary(summary_path, pa)
+    summary.raw["matrix_source"] = matrix_source
+    summary.raw["annotation_source"] = annotation_source
+
     data = PangenomeData("panaroo", outdir, pa, metadata, summary)
     data.validate()
     return data
@@ -537,10 +609,15 @@ def load_pangenome(
     *,
     pirate_threshold: Optional[float] = 95,
     prefer_panaroo_rtab: bool = True,
+    panaroo_from_csv: Optional[bool] = None,
     panaroo_csv_chunksize: int = 500,
 ) -> PangenomeData:
     """Load and normalise a PIRATE or Panaroo output directory."""
     normalised = _normalise_tool(tool)
+
+    if panaroo_from_csv is not None:
+        prefer_panaroo_rtab = not bool(panaroo_from_csv)
+
     root = Path(outdir).expanduser().resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"Pangenome output directory does not exist: {root}")
