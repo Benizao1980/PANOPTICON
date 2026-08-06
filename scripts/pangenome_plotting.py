@@ -681,20 +681,32 @@ def main() -> None:
         labels = meta_df[args.meta_col]
         labels.name = args.meta_col
 
-    need_df01 = any([
+    need_full_matrix = any([
         args.pca, args.mds, args.umap, args.gene_counts, args.pca_gene_count,
         args.heatmap_top is not None, args.rarefaction, args.rarefaction_by is not None,
         args.fst, args.fst_pairwise,
     ])
-    df01 = pg.presence_absence if need_df01 else None
-    if df01 is not None:
+    full_df01 = pg.presence_absence if need_full_matrix else None
+
+    # Ordination, heatmaps and FST require variable features. Rarefaction and
+    # per-genome gene-family counts must use the complete pangenome matrix.
+    need_variable_matrix = any([
+        args.pca, args.mds, args.umap, args.pca_gene_count,
+        args.heatmap_top is not None, args.fst, args.fst_pairwise,
+    ])
+    df01 = None
+    if full_df01 is not None:
         if meta_df is not None:
-            extra = meta_df.reindex(df01.index)
+            extra = meta_df.reindex(full_df01.index)
             if labels is not None:
-                labels = labels.reindex(df01.index)
-        df01 = filter_variable_columns(df01)
-        if df01.shape[1] < 2:
-            raise ValueError("After filtering, fewer than two variable gene families remain.")
+                labels = labels.reindex(full_df01.index)
+        if need_variable_matrix:
+            df01 = filter_variable_columns(full_df01)
+            if df01.shape[1] < 2:
+                raise ValueError(
+                    "After variable-family filtering, fewer than two gene "
+                    "families remain for ordination/association."
+                )
 
     plt.rcParams.update({
         "axes.linewidth": 1.2,
@@ -709,9 +721,9 @@ def main() -> None:
     })
 
     if args.rarefaction:
-        assert df01 is not None
+        assert full_df01 is not None
         curves = compute_rarefaction_curves(
-            df01, steps=args.rare_steps, reps=args.rare_reps, seed=args.rare_seed
+            full_df01, steps=args.rare_steps, reps=args.rare_reps, seed=args.rare_seed
         )
         curves.to_csv(os.path.join(outdir, "pangenome_rarefaction.csv"), index=False)
         plot_rarefaction(
@@ -722,21 +734,27 @@ def main() -> None:
         )
 
     if args.rarefaction_by:
-        assert df01 is not None
+        assert full_df01 is not None
         if meta_df is None:
             raise ValueError("--rarefaction-by requires --meta")
         if args.rarefaction_by not in meta_df.columns:
             raise ValueError(f"--rarefaction-by '{args.rarefaction_by}' not found in metadata columns")
-        grp_series = meta_df[args.rarefaction_by].reindex(df01.index)
+        grp_series = meta_df[args.rarefaction_by].reindex(full_df01.index)
         curves_by = compute_rarefaction_curves_by_group(
-            df01, grp_series, steps=args.rare_steps, reps=args.rare_reps,
+            full_df01, grp_series, steps=args.rare_steps, reps=args.rare_reps,
             seed=args.rare_seed, min_group_size=args.min_group_size,
             max_groups=args.max_groups,
         )
-        curves_by.to_csv(
-            os.path.join(outdir, f"pangenome_rarefaction_by_{args.rarefaction_by}.csv"),
-            index=False,
-        )
+        stacked = []
+        for group_name, curve in curves_by.items():
+            current = curve.copy()
+            current.insert(0, args.rarefaction_by, group_name)
+            stacked.append(current)
+        if stacked:
+            pd.concat(stacked, ignore_index=True).to_csv(
+                os.path.join(outdir, f"pangenome_rarefaction_by_{args.rarefaction_by}.csv"),
+                index=False,
+            )
         plot_rarefaction_by_group(
             curves_by,
             os.path.join(outdir, f"pangenome_rarefaction_by_{args.rarefaction_by}.png"),
@@ -791,10 +809,12 @@ def main() -> None:
     if args.gene_freq:
         plot_gene_frequency_hist(family_metadata, os.path.join(outdir, "gene_frequency_hist.png"))
 
-    if df01 is not None:
-        gene_counts = gene_counts_per_genome(df01)
+    if full_df01 is not None:
+        gene_counts = gene_counts_per_genome(full_df01)
         if args.gene_counts:
             plot_gene_count_distribution(gene_counts, os.path.join(outdir, "gene_count_per_genome.png"))
+
+    if df01 is not None:
         if args.heatmap_top is not None:
             plot_top_variance_heatmap(
                 df01, top_n=args.heatmap_top,

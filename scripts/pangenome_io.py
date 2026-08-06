@@ -424,30 +424,46 @@ def _read_fasta_records(path: Path) -> Tuple[List[str], List[str]]:
 
 
 def read_pirate_binary_fasta(path: Path) -> pd.DataFrame:
-    """Read PIRATE binary_presence_absence.fasta.
+    """Read PIRATE ``binary_presence_absence.fasta``.
 
-    Supports A/C (A=absent, C=present) and 0/1 encodings. PIRATE normally
-    writes one record per genome.
+    PIRATE A/C encoding uses ``A = present`` and ``C = absent``. 0/1 input is
+    also supported with ``1 = present``. Records are genomes and sequence
+    positions are anonymous family positions.
+
+    This function is retained as a backwards-compatible fallback. The primary
+    PIRATE loader uses the per-genome columns in ``PIRATE.gene_families*.tsv``
+    because those columns carry explicit family IDs and can be validated
+    against ``number_genomes``.
     """
     ids, seqs = _read_fasta_records(path)
     lengths = {len(s) for s in seqs}
     if len(lengths) != 1:
         raise ValueError(f"PIRATE binary FASTA is not rectangular: {path}")
 
-    def decode(seq: str) -> np.ndarray:
-        return np.fromiter(
-            (1 if char.upper() in {"C", "1"} else 0 for char in seq),
+    alphabet = set("".join(seqs).upper())
+    if alphabet.issubset({"A", "C"}):
+        presence = {"A"}
+    elif alphabet.issubset({"0", "1"}):
+        presence = {"1"}
+    else:
+        raise ValueError(
+            "Unsupported PIRATE binary FASTA alphabet "
+            f"{sorted(alphabet)} in {path}; expected A/C or 0/1."
+        )
+
+    matrix = np.vstack([
+        np.fromiter(
+            (1 if char.upper() in presence else 0 for char in seq),
             dtype=np.uint8,
             count=len(seq),
         )
-
-    matrix = np.vstack([decode(s) for s in seqs])
+        for seq in seqs
+    ])
     columns = [f"gf_{i + 1}" for i in range(matrix.shape[1])]
     out = pd.DataFrame(matrix, index=ids, columns=columns, dtype=np.uint8)
     out.index.name = "sample"
     out.columns.name = "gene_family"
     return out
-
 
 def _pirate_family_id_column(df: pd.DataFrame) -> Optional[str]:
     candidates = [
@@ -474,67 +490,149 @@ def _pirate_count_column(df: pd.DataFrame) -> Optional[str]:
     return next((c for c in candidates if c in df.columns), None)
 
 
+
+def read_pirate_family_table_matrix(
+    path: Path,
+    sample_ids: Optional[Sequence[str]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the canonical PIRATE matrix directly from the family table.
+
+    PIRATE ``PIRATE.gene_families.ordered.tsv`` contains one row per gene
+    family and one column per genome. A non-empty genome cell denotes presence.
+
+    Using this table avoids two unsafe assumptions about
+    ``binary_presence_absence.fasta``:
+      1. A/C polarity (PIRATE uses A=present, C=absent).
+      2. Positional family order, which need not match the ordered family TSV.
+
+    When ``sample_ids`` are provided (normally from the binary FASTA headers),
+    those exact columns are used and their order is preserved. Otherwise,
+    columns following ``cluster_order`` are treated as genome columns.
+
+    The resulting row sums are validated against PIRATE ``number_genomes`` when
+    that field is available. Any discrepancy is treated as a hard error.
+    """
+    table = pd.read_csv(
+        path,
+        sep="\t",
+        dtype=str,
+        keep_default_na=False,
+        low_memory=False,
+    )
+    if table.empty:
+        raise ValueError(f"PIRATE family table is empty: {path}")
+
+    id_col = _pirate_family_id_column(table)
+    if id_col is None:
+        raise ValueError(
+            f"Could not identify a PIRATE family-ID column in {path}. "
+            f"Found: {list(table.columns[:25])}"
+        )
+
+    requested = [str(x) for x in sample_ids] if sample_ids is not None else []
+    if requested:
+        missing = [x for x in requested if x not in table.columns]
+        if missing:
+            raise ValueError(
+                "PIRATE family table is missing genome columns found in the "
+                f"binary FASTA, e.g. {missing[:10]}"
+            )
+        sample_cols = requested
+    elif "cluster_order" in table.columns:
+        start = table.columns.get_loc("cluster_order") + 1
+        sample_cols = [str(c) for c in table.columns[start:]]
+    else:
+        raise ValueError(
+            "Could not infer PIRATE genome columns. Supply a binary FASTA with "
+            "matching genome IDs or use a family table containing cluster_order."
+        )
+
+    if not sample_cols:
+        raise ValueError(f"No PIRATE genome columns detected in {path}")
+
+    family_ids = _make_unique(table[id_col].astype(str), prefix="pirate_family")
+
+    # PIRATE genome cells contain locus/allele identifiers when present and are
+    # blank when absent.
+    family_by_sample = table[sample_cols].apply(
+        lambda col: col.astype(str).str.strip().ne("")
+    ).astype(np.uint8)
+    family_by_sample.index = family_ids
+    family_by_sample.index.name = "gene_family"
+
+    observed = family_by_sample.sum(axis=1).astype(int)
+
+    count_col = _pirate_count_column(table)
+    source_counts: Optional[pd.Series] = None
+    if count_col is not None:
+        source_counts = pd.to_numeric(table[count_col], errors="coerce")
+        comparable = source_counts.notna()
+        mismatch = comparable & (
+            observed.to_numpy() != source_counts.fillna(-1).astype(int).to_numpy()
+        )
+        if mismatch.any():
+            bad_idx = np.flatnonzero(mismatch)[:10]
+            examples = [
+                (
+                    family_ids[i],
+                    int(observed.iloc[i]),
+                    int(source_counts.iloc[i]),
+                )
+                for i in bad_idx
+            ]
+            raise ValueError(
+                "PIRATE family-table presence/absence does not agree with "
+                f"'{count_col}'. Example (family, observed, expected): {examples}"
+            )
+
+    pa = family_by_sample.T.copy()
+    pa.index = pd.Index(sample_cols, name="sample")
+    pa.columns.name = "gene_family"
+
+    metadata = table.copy()
+    metadata["gene_family"] = family_ids
+    metadata = metadata.set_index("gene_family", drop=False)
+    metadata["n_genomes"] = observed.to_numpy()
+    if source_counts is not None:
+        metadata["n_genomes_source"] = source_counts.to_numpy()
+    metadata["prevalence"] = _safe_fraction(metadata["n_genomes"], len(sample_cols))
+    metadata["source_tool"] = "pirate"
+
+    # Tool-neutral aliases while retaining all original PIRATE fields.
+    if "consensus_gene_name" in metadata.columns:
+        metadata["gene_name"] = metadata["consensus_gene_name"]
+    elif "gene_name" not in metadata.columns:
+        metadata["gene_name"] = pd.NA
+
+    if "consensus_product" in metadata.columns:
+        metadata["annotation"] = metadata["consensus_product"]
+    else:
+        for candidate in ["gene_product", "product", "annotation"]:
+            if candidate in metadata.columns:
+                metadata["annotation"] = metadata[candidate]
+                break
+        else:
+            metadata["annotation"] = pd.NA
+
+    return pa, metadata
+
 def read_pirate_family_metadata(
     path: Path,
     presence_absence: pd.DataFrame,
     threshold: Optional[float] = 95,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Read PIRATE family table and attach IDs to binary FASTA columns.
+    """Backwards-compatible wrapper using explicit PIRATE genome columns.
 
-    PIRATE versions and settings produce slightly different tables. If a
-    multi-threshold table is supplied, the requested threshold is selected
-    when possible. If the selected row count matches the binary matrix width,
-    its family IDs replace generic gf_1...gf_n labels.
+    ``threshold`` is retained for API compatibility but is not used to filter
+    ``PIRATE.gene_families.ordered.tsv``: the ordered table already represents
+    the final family set, and its ``threshold`` field is family metadata rather
+    than a request to select only rows equal to 95.
     """
-    table = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
-    selected = table.copy()
-    if threshold is not None and "threshold" in selected.columns:
-        numeric = pd.to_numeric(selected["threshold"], errors="coerce")
-        mask = numeric.eq(float(threshold))
-        if mask.any():
-            selected = selected.loc[mask].copy()
-
-    id_col = _pirate_family_id_column(selected)
-    if id_col is not None:
-        ids = _make_unique(selected[id_col].astype(str), prefix="pirate_family")
-    else:
-        ids = [f"gf_{i + 1}" for i in range(len(selected))]
-
-    pa = presence_absence.copy()
-    if len(ids) == pa.shape[1]:
-        pa.columns = ids
-        pa.columns.name = "gene_family"
-    else:
-        # Keep safe positional IDs rather than risking a wrong mapping.
-        ids = list(pa.columns)
-        selected = selected.iloc[: len(ids)].copy()
-        if len(selected) < len(ids):
-            selected = selected.reindex(range(len(ids)))
-
-    selected = selected.copy()
-    selected["gene_family"] = ids
-    selected = selected.set_index("gene_family", drop=False)
-    selected = selected.reindex(pa.columns)
-
-    counts = pa.sum(axis=0).astype(int)
-    count_col = _pirate_count_column(selected)
-    if count_col is not None:
-        parsed_counts = pd.to_numeric(selected[count_col], errors="coerce")
-        selected["n_genomes_source"] = parsed_counts
-    selected["n_genomes"] = counts.reindex(selected.index).fillna(0).astype(int)
-    selected["prevalence"] = _safe_fraction(selected["n_genomes"], pa.shape[0])
-    selected["source_tool"] = "pirate"
-
-    # Tool-neutral aliases where the source table provides likely fields.
-    for candidate in ["gene_product", "product", "annotation"]:
-        if candidate in selected.columns:
-            selected["annotation"] = selected[candidate]
-            break
-    if "gene_name" in selected.columns:
-        selected["gene_name"] = selected["gene_name"]
-
-    return pa, selected
-
+    del threshold
+    return read_pirate_family_table_matrix(
+        path,
+        sample_ids=[str(x) for x in presence_absence.index],
+    )
 
 def parse_pirate_summary(
     path: Optional[Path],
@@ -573,10 +671,9 @@ def load_pirate(
     outdir: Path,
     threshold: Optional[float] = 95,
 ) -> PangenomeData:
-    binary_path = _first_existing(
-        outdir,
-        ["binary_presence_absence.fasta", "binary_presence_absence.fa"],
-    )
+    """Load PIRATE using the family table as the authoritative matrix source."""
+    del threshold  # retained in public API for backwards compatibility
+
     family_path = _first_existing(
         outdir,
         [
@@ -585,14 +682,43 @@ def load_pirate(
             "PIRATE.gene_families.tab",
         ],
     )
-    pa = read_pirate_binary_fasta(binary_path)
-    pa, metadata = read_pirate_family_metadata(family_path, pa, threshold=threshold)
+    binary_path = _first_existing(
+        outdir,
+        ["binary_presence_absence.fasta", "binary_presence_absence.fa"],
+        required=False,
+    )
+
+    sample_ids: Optional[List[str]] = None
+    binary_encoding: Optional[str] = None
+    if binary_path is not None:
+        ids, seqs = _read_fasta_records(binary_path)
+        sample_ids = [str(x) for x in ids]
+        alphabet = set("".join(seqs).upper())
+        if alphabet.issubset({"A", "C"}):
+            binary_encoding = "A=present,C=absent"
+        elif alphabet.issubset({"0", "1"}):
+            binary_encoding = "1=present,0=absent"
+        else:
+            binary_encoding = f"unrecognised:{''.join(sorted(alphabet))}"
+
+    pa, metadata = read_pirate_family_table_matrix(
+        family_path,
+        sample_ids=sample_ids,
+    )
+
     summary_path = _first_existing(
         outdir,
         ["PIRATE.pangenome_summary.txt", "pangenome_summary.txt"],
         required=False,
     )
     summary = parse_pirate_summary(summary_path, pa)
+    summary.raw["matrix_source"] = family_path.name
+    summary.raw["family_count_validation"] = "passed"
+    if binary_path is not None:
+        summary.raw["binary_fasta"] = binary_path.name
+        summary.raw["binary_encoding"] = binary_encoding
+        summary.raw["binary_fasta_used_for_matrix"] = False
+
     data = PangenomeData("pirate", outdir, pa, metadata, summary)
     data.validate()
     return data
